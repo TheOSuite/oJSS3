@@ -20,6 +20,17 @@ from urllib.robotparser import RobotFileParser
 import html
 import webbrowser
 import base64
+import socket
+import dns.resolver
+import dns.zone
+import dns.query
+import xml.etree.ElementTree as ET
+from typing import List, Tuple, Dict, Set, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential
+import pickle
+import asyncio
+import aiohttp
+import aiodns
 
 # Configure logging
 logging.basicConfig(
@@ -35,11 +46,13 @@ logging.basicConfig(
 DEFAULT_LINKFINDER_PATH = r"C:\LinkFinder\linkfinder.py"
 DEFAULT_NODE_SCRIPT_PATH = r"C:\LinkFinder\parse_js.js"
 CONFIG_FILE = "config.json"
+CACHE_FILE = "github_cache.pkl"
 NODE_NOT_FOUND_WARNING = "Node.js or parse_js.js not found. Falling back to jsbeautifier. Install Node.js and Esprima (npm install esprima) or check the script path."
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_SEARCH_RATE_LIMIT = 30
-GITHUB_CACHE = {}
-s3_status_cache = {}
+GITHUB_CACHE: Dict[str, List[Tuple[str, str]]] = {}
+s3_status_cache: Dict[str, Dict[str, str]] = {}
+DEFAULT_WORDLIST = os.path.join(os.path.dirname(__file__), "wordlist.txt")
 
 # Common bucket prefixes
 COMMON_BUCKET_PREFIXES = [
@@ -76,7 +89,8 @@ except ImportError:
     logging.warning("LinkFinder module not imported. Falling back to subprocess.")
 
 # Config functions
-def load_config():
+def load_config() -> Dict:
+    """Load configuration from config.json."""
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -96,41 +110,77 @@ def load_config():
             "node_script_path": DEFAULT_NODE_SCRIPT_PATH
         }
 
-def save_config(config):
+def save_config(config: Dict) -> None:
+    """Save configuration to config.json."""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
     except Exception as e:
         logging.error(f"Failed to save config: {str(e)}")
 
-# New: Parse sitemap
-def parse_sitemap(base_url):
-    """Fetch and parse sitemap URLs from a given base URL."""
+def load_cache() -> None:
+    """Load GitHub cache from disk."""
+    global GITHUB_CACHE
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "rb") as f:
+                GITHUB_CACHE = pickle.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load cache: {str(e)}")
+
+def save_cache() -> None:
+    """Save GitHub cache to disk."""
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump(GITHUB_CACHE, f)
+    except Exception as e:
+        logging.error(f"Failed to save cache: {str(e)}")
+
+# Sitemap parsing
+def parse_sitemap(base_url: str) -> List[str]:
+    """Fetch and parse sitemap URLs, handling sitemap indexes."""
     sitemap_urls = []
     try:
         sitemap_url = urljoin(base_url, "/sitemap.xml")
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         response = requests.get(sitemap_url, headers=headers, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "xml")
-        for loc in soup.find_all("loc"):
-            url = loc.text.strip()
-            if url:
-                sitemap_urls.append(url)
-        logging.info(f"Found {len(sitemap_urls)} URLs in sitemap: {sitemap_url}")
+
+        try:
+            root = ET.fromstring(response.text)
+            ns = {"sitemap": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            for loc in root.findall(".//sitemap:loc", ns):
+                url = loc.text.strip()
+                if url:
+                    sitemap_urls.append(url)
+                    # Handle sitemap index by recursively parsing
+                    if url.endswith(".xml"):
+                        sitemap_urls.extend(parse_sitemap(url))
+            logging.info(f"Found {len(sitemap_urls)} URLs in sitemap: {sitemap_url}")
+        except ET.ParseError:
+            try:
+                soup = BeautifulSoup(response.text, "xml")
+                for loc in soup.find_all("loc"):
+                    url = loc.text.strip()
+                    if url:
+                        sitemap_urls.append(url)
+                        if url.endswith(".xml"):
+                            sitemap_urls.extend(parse_sitemap(url))
+                logging.info(f"Fallback to lxml: Found {len(sitemap_urls)} URLs in sitemap: {sitemap_url}")
+            except Exception as e:
+                logging.error(f"Failed to parse sitemap XML with lxml: {str(e)}")
     except requests.RequestException as e:
         logging.warning(f"Failed to fetch sitemap {sitemap_url}: {str(e)}")
     return sitemap_urls
 
-# New: Fetch URL content
-def fetch_url_content(url, respect_robots=True):
+# Fetch URL content
+def fetch_url_content(url: str, respect_robots: bool = True) -> Tuple[Optional[str], str]:
     """Fetch content from a URL, respecting robots.txt if enabled."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         parsed_url = urlparse(url)
         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-        # Check robots.txt
         if respect_robots:
             rp = RobotFileParser()
             robots_url = urljoin(base_url, "/robots.txt")
@@ -151,19 +201,17 @@ def fetch_url_content(url, respect_robots=True):
         logging.error(f"Failed to fetch {url}: {str(e)}")
         return None, str(e)
 
-# New: Extract JS from HTML
-def extract_js_from_html(html_content, base_url="", extract_urls=False):
+# Extract JS from HTML
+def extract_js_from_html(html_content: str, base_url: str = "", extract_urls: bool = False) -> List[str]:
     """Extract JavaScript code or URLs from HTML."""
     js_blocks = []
     try:
         soup = BeautifulSoup(html_content, "html.parser")
-        # Inline scripts
         for script in soup.find_all("script", src=False):
             if script.string:
                 beautified = jsbeautifier.beautify(script.string.strip())
                 if beautified:
                     js_blocks.append(beautified)
-        # External scripts
         if extract_urls:
             for script in soup.find_all("script", src=True):
                 src = script.get("src")
@@ -175,24 +223,24 @@ def extract_js_from_html(html_content, base_url="", extract_urls=False):
         logging.error(f"Error extracting JS from HTML: {str(e)}")
     return js_blocks
 
-# New: Filter JS files
-def filter_js_files(js_urls, pattern):
+# Filter JS files
+def filter_js_files(js_urls: List[str], pattern: str) -> List[str]:
     """Filter JavaScript URLs based on a pattern."""
     if not pattern:
         return js_urls
     return [url for url in js_urls if fnmatch.fnmatch(url, pattern)]
 
-# New: Run LinkFinder
-def run_linkfinder(input_path):
+# Run LinkFinder
+def run_linkfinder(input_path: str) -> List[str]:
     """Run LinkFinder on a JavaScript file."""
     config = load_config()
     linkfinder_path = config.get("linkfinder_path", DEFAULT_LINKFINDER_PATH)
     endpoints = []
-    
+
     if not os.path.exists(input_path):
         logging.error(f"Input file does not exist: {input_path}")
         return endpoints
-    
+
     if linkfinder_main:
         try:
             endpoints = linkfinder_main(input_path)
@@ -218,11 +266,11 @@ def run_linkfinder(input_path):
             logging.error(f"LinkFinder subprocess timed out for {input_path}")
         except Exception as e:
             logging.error(f"LinkFinder subprocess error: {str(e)}")
-    
+
     return endpoints
 
-# New: Extract endpoints
-def extract_endpoints(content, file_ext=""):
+# Extract endpoints
+def extract_endpoints(content: str, file_ext: str = "") -> List[str]:
     """Extract endpoints using regex."""
     endpoints = []
     try:
@@ -236,16 +284,15 @@ def extract_endpoints(content, file_ext=""):
         logging.error(f"Error extracting endpoints: {str(e)}")
     return sorted(set(endpoints))
 
-# New: Test S3 public access
-def test_s3_public_access(bucket_url, bucket_name):
+# Test S3 public access
+def test_s3_public_access(bucket_url: str, bucket_name: str) -> Dict[str, str]:
     """Test if an S3 bucket is publicly accessible."""
     if bucket_url in s3_status_cache:
         return s3_status_cache[bucket_url]
-    
+
     access = {"listing": "Not Listable", "readable": "Not Readable", "details": ""}
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        # Test bucket listing
         response = requests.get(bucket_url, headers=headers, timeout=10)
         if response.status_code == 200 and "<ListBucketResult" in response.text:
             access["listing"] = "Listable"
@@ -257,12 +304,12 @@ def test_s3_public_access(bucket_url, bucket_name):
             access["details"] = f"HTTP {response.status_code}: Access denied or bucket does not exist."
     except requests.RequestException as e:
         access["details"] = f"Error testing access: {str(e)}"
-    
+
     s3_status_cache[bucket_url] = access
     return access
 
-# New: Export S3 results
-def export_s3_results(s3_buckets):
+# Export functions
+def export_s3_results(s3_buckets: List[Tuple[str, str]]) -> None:
     """Export S3 bucket results to a file."""
     if not s3_buckets:
         messagebox.showinfo("Export", "No S3 buckets to export.")
@@ -281,8 +328,7 @@ def export_s3_results(s3_buckets):
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export S3 results: {str(e)}")
 
-# New: Export all results
-def export_all_results(input_val, endpoints, s3_buckets, js_endpoints):
+def export_all_results(input_val: str, endpoints: List[str], s3_buckets: List[Tuple[str, str]], js_endpoints: Dict[str, List[str]]) -> None:
     """Export all results to a JSON file."""
     if not (endpoints or s3_buckets or js_endpoints):
         messagebox.showinfo("Export", "No results to export.")
@@ -312,8 +358,7 @@ def export_all_results(input_val, endpoints, s3_buckets, js_endpoints):
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export results: {str(e)}")
 
-# New: Export JS endpoints
-def export_js_endpoints(js_endpoints):
+def export_js_endpoints(js_endpoints: Dict[str, List[str]]) -> None:
     """Export JavaScript endpoints to a file."""
     if not js_endpoints:
         messagebox.showinfo("Export", "No JavaScript endpoints to export.")
@@ -336,8 +381,7 @@ def export_js_endpoints(js_endpoints):
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export JS endpoints: {str(e)}")
 
-# New: Export HTML report
-def export_html_report(input_val, endpoints, s3_buckets, js_endpoints):
+def export_html_report(input_val: str, endpoints: List[str], s3_buckets: List[Tuple[str, str]], js_endpoints: Dict[str, List[str]]) -> None:
     """Export results to an HTML report."""
     if not (endpoints or s3_buckets or js_endpoints):
         messagebox.showinfo("Export", "No results to export.")
@@ -417,8 +461,8 @@ def export_html_report(input_val, endpoints, s3_buckets, js_endpoints):
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export HTML report: {str(e)}")
 
-# New: Browse file
-def on_browse(entry):
+# Browse functions
+def on_browse(entry: tk.Entry) -> None:
     """Browse for input file."""
     path = filedialog.askopenfilename(
         filetypes=[("All Files", "*.*"), ("JavaScript Files", "*.js"), ("HTML Files", "*.html")]
@@ -427,8 +471,7 @@ def on_browse(entry):
         entry.delete(0, tk.END)
         entry.insert(0, path)
 
-# New: Browse LinkFinder
-def on_browse_linkfinder(entry):
+def on_browse_linkfinder(entry: tk.Entry) -> None:
     """Browse for LinkFinder script."""
     path = filedialog.askopenfilename(
         filetypes=[("Python Files", "*.py"), ("All Files", "*.*")],
@@ -441,8 +484,7 @@ def on_browse_linkfinder(entry):
         config["linkfinder_path"] = path
         save_config(config)
 
-# New: Browse Node.js script
-def on_browse_node_script(entry):
+def on_browse_node_script(entry: tk.Entry) -> None:
     """Browse for Node.js parser script."""
     path = filedialog.askopenfilename(
         filetypes=[("JavaScript Files", "*.js"), ("All Files", "*.*")],
@@ -455,9 +497,399 @@ def on_browse_node_script(entry):
         config["node_script_path"] = path
         save_config(config)
 
-# New: Generate bucket names
-def generate_bucket_names(target):
-    """Generate potential S3 bucket names based on target."""
+# Subdomain discovery functions
+async def async_dns_resolve(subdomain: str) -> Optional[str]:
+    """Asynchronously resolve a subdomain to an IP."""
+    resolver = aiodns.DNSResolver()
+    try:
+        result = await resolver.query(subdomain, 'A')
+        return result[0].host if result else None
+    except Exception:
+        return None
+
+def dns_bruteforce(domain: str, wordlist: str) -> List[str]:
+    """Bruteforce subdomains using a wordlist."""
+    if not wordlist or not os.path.exists(wordlist):
+        wordlist = DEFAULT_WORDLIST
+        if not os.path.exists(wordlist):
+            logging.warning("No wordlist provided; creating default wordlist.")
+            with open(wordlist, "w", encoding="utf-8") as f:
+                f.write("\n".join(["admin", "api", "dev", "staging", "test"]))
+    
+    subdomains = []
+    try:
+        with open(wordlist, "r", encoding="utf-8") as f:
+            words = [line.strip() for line in f if line.strip()]
+        
+        async def resolve_batch(batch: List[str]) -> List[str]:
+            async with aiohttp.ClientSession() as session:
+                tasks = [async_dns_resolve(f"{word}.{domain}") for word in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                return [f"{word}.{domain}" for word, ip in zip(batch, results) if ip]
+        
+        batch_size = 50
+        for i in range(0, len(words), batch_size):
+            batch = words[i:i + batch_size]
+            loop = asyncio.get_event_loop()
+            found = loop.run_until_complete(resolve_batch(batch))
+            subdomains.extend(found)
+            logging.info(f"Bruteforced {len(found)} subdomains in batch {i//batch_size + 1}")
+    
+    except Exception as e:
+        logging.error(f"Bruteforce failed: {str(e)}")
+    
+    return subdomains
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def query_certificate_transparency(domain: str) -> List[str]:
+    """Query Certificate Transparency logs for subdomains."""
+    subdomains = set()
+    try:
+        url = f"https://crt.sh/?q=%.{domain}&output=json"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        for entry in data:
+            name_value = entry.get('name_value', '')
+            if name_value:
+                if '*.' in name_value:
+                    name_value = name_value.replace('*.', '')
+                if domain in name_value:
+                    subdomains.add(name_value.lower())
+        logging.info(f"Found {len(subdomains)} subdomains via CT logs")
+    except Exception as e:
+        logging.error(f"CT log query failed: {str(e)}")
+        raise
+    return list(subdomains)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def query_dns_dbs(domain: str) -> List[str]:
+    """Query various DNS databases for subdomains."""
+    sources = [
+        f"https://api.hackertarget.com/hostsearch/?q={domain}",
+        f"https://riddler.io/search/exportcsv?q=pld:{domain}"
+    ]
+    subdomains = set()
+    
+    for source in sources:
+        try:
+            response = requests.get(source, timeout=15)
+            response.raise_for_status()
+            lines = response.text.splitlines()
+            for line in lines:
+                if ',' in line:
+                    subdomain = line.split(',')[0].strip()
+                else:
+                    subdomain = line.strip()
+                if subdomain.endswith(f".{domain}"):
+                    subdomains.add(subdomain.lower())
+        except Exception as e:
+            logging.warning(f"Failed to query {source}: {str(e)}")
+    
+    logging.info(f"Found {len(subdomains)} subdomains via DNS databases")
+    return list(subdomains)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def query_securitytrails(domain: str, api_key: str) -> List[str]:
+    """Query SecurityTrails API for subdomains."""
+    if not api_key:
+        logging.warning("SecurityTrails API key not provided")
+        return []
+        
+    url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
+    headers = {"APIKEY": api_key}
+    subdomains = set()
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        for subdomain in data.get('subdomains', []):
+            full_domain = f"{subdomain}.{domain}"
+            subdomains.add(full_domain.lower())
+        logging.info(f"Found {len(subdomains)} subdomains via SecurityTrails")
+    except Exception as e:
+        logging.error(f"SecurityTrails API query failed: {str(e)}")
+        raise
+    
+    return list(subdomains)
+
+def attempt_zone_transfer(domain: str) -> List[str]:
+    """Attempt DNS zone transfer with timeout."""
+    subdomains = set()
+    
+    try:
+        answers = dns.resolver.resolve(domain, 'NS', lifetime=5)
+        nameservers = [str(rdata.target).rstrip('.') for rdata in answers]
+        
+        for ns in nameservers:
+            try:
+                z = dns.zone.from_xfr(dns.query.xfr(ns, domain, timeout=5))
+                names = z.nodes.keys()
+                for name in names:
+                    subdomain = name.to_text() + '.' + domain
+                    if subdomain.startswith('@'):
+                        subdomain = subdomain.replace('@.', '')
+                    subdomains.add(subdomain)
+                logging.info(f"Successful zone transfer from {ns}!")
+            except Exception as e:
+                logging.debug(f"Zone transfer failed from {ns}: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error in zone transfer attempt: {str(e)}")
+    
+    return list(subdomains)
+
+def create_subdomain_tab(notebook: ttk.Notebook, main_entry: tk.Entry) -> ttk.Frame:
+    """Create the subdomain discovery tab in the UI."""
+    subdomain_frame = ttk.Frame(notebook)
+    notebook.add(subdomain_frame, text="Subdomain Discovery")
+
+    # Domain input
+    domain_frame = ttk.Frame(subdomain_frame)
+    domain_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(domain_frame, text="Domain:").pack(side=tk.LEFT)
+    domain_entry = ttk.Entry(domain_frame, width=30)
+    domain_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    # Method selection
+    method_frame = ttk.Frame(subdomain_frame)
+    method_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(method_frame, text="Discovery Methods:").pack(side=tk.LEFT)
+
+    ct_logs_var = tk.BooleanVar(value=True)
+    dns_db_var = tk.BooleanVar(value=True)
+    securitytrails_var = tk.BooleanVar(value=False)
+    bruteforce_var = tk.BooleanVar(value=False)
+    zone_transfer_var = tk.BooleanVar(value=False)
+
+    ttk.Checkbutton(method_frame, text="Certificate Transparency", variable=ct_logs_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(method_frame, text="DNS Databases", variable=dns_db_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(method_frame, text="SecurityTrails API", variable=securitytrails_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(method_frame, text="Bruteforce", variable=bruteforce_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(method_frame, text="Zone Transfer", variable=zone_transfer_var).pack(side=tk.LEFT, padx=5)
+
+    # API Key configuration
+    api_frame = ttk.Frame(subdomain_frame)
+    api_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(api_frame, text="SecurityTrails API Key:").pack(side=tk.LEFT)
+    api_key_entry = ttk.Entry(api_frame, width=40, show="*")
+    api_key_entry.pack(side=tk.LEFT, padx=5)
+
+    # Wordlist for bruteforce
+    wordlist_frame = ttk.Frame(subdomain_frame)
+    wordlist_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(wordlist_frame, text="Bruteforce Wordlist:").pack(side=tk.LEFT)
+    wordlist_entry = ttk.Entry(wordlist_frame, width=40)
+    wordlist_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    ttk.Button(wordlist_frame, text="Browse", 
+               command=lambda: wordlist_entry.insert(0, filedialog.askopenfilename(
+                   filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+               ))).pack(side=tk.LEFT)
+
+    # Output area
+    output_frame = ttk.Frame(subdomain_frame)
+    output_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    subdomain_output = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, width=80, height=20)
+    subdomain_output.pack(fill=tk.BOTH, expand=True)
+
+    # Progress bar
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(subdomain_frame, variable=progress_var, maximum=100)
+    progress_bar.pack(fill=tk.X, padx=10, pady=5)
+
+    # Action buttons
+    button_frame = ttk.Frame(subdomain_frame)
+    button_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    def validate_domain(domain: str) -> bool:
+        """Validate domain name format."""
+        return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$', domain))
+
+    def on_discover():
+        domain = domain_entry.get().strip()
+        if not domain or not validate_domain(domain):
+            messagebox.showerror("Error", "Please enter a valid domain name (e.g., example.com)")
+            return
+
+        subdomain_output.delete(1.0, tk.END)
+        subdomain_output.insert(tk.END, f"Discovering subdomains for {domain}...\n\n")
+        discovered = set()
+
+        def discovery_task():
+            total_methods = sum([
+                ct_logs_var.get(), 
+                dns_db_var.get(), 
+                securitytrails_var.get(), 
+                bruteforce_var.get(), 
+                zone_transfer_var.get()
+            ])
+            methods_completed = 0
+
+            if ct_logs_var.get():
+                subdomain_output.insert(tk.END, "Querying Certificate Transparency logs...\n")
+                subdomains = query_certificate_transparency(domain)
+                discovered.update(subdomains)
+                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via CT logs\n\n")
+                methods_completed += 1
+                progress_var.set((methods_completed / total_methods) * 100)
+
+            if dns_db_var.get():
+                subdomain_output.insert(tk.END, "Querying DNS databases...\n")
+                subdomains = query_dns_dbs(domain)
+                discovered.update(subdomains)
+                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via DNS databases\n\n")
+                methods_completed += 1
+                progress_var.set((methods_completed / total_methods) * 100)
+
+            if securitytrails_var.get():
+                api_key = api_key_entry.get().strip()
+                if api_key:
+                    subdomain_output.insert(tk.END, "Querying SecurityTrails API...\n")
+                    subdomains = query_securitytrails(domain, api_key)
+                    discovered.update(subdomains)
+                    subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via SecurityTrails\n\n")
+                else:
+                    subdomain_output.insert(tk.END, "SecurityTrails API key not provided, skipping...\n\n")
+                methods_completed += 1
+                progress_var.set((methods_completed / total_methods) * 100)
+
+            if bruteforce_var.get():
+                wordlist = wordlist_entry.get().strip()
+                subdomain_output.insert(tk.END, "Bruteforcing subdomains...\n")
+                subdomains = dns_bruteforce(domain, wordlist)
+                discovered.update(subdomains)
+                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via bruteforce\n\n")
+                methods_completed += 1
+                progress_var.set((methods_completed / total_methods) * 100)
+
+            if zone_transfer_var.get():
+                subdomain_output.insert(tk.END, "Attempting zone transfers...\n")
+                subdomains = attempt_zone_transfer(domain)
+                discovered.update(subdomains)
+                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via zone transfer\n\n")
+                methods_completed += 1
+                progress_var.set((methods_completed / total_methods) * 100)
+
+            sorted_subdomains = sorted(list(discovered))
+            subdomain_output.insert(tk.END, f"==== Discovery Complete ====\n")
+            subdomain_output.insert(tk.END, f"Total unique subdomains found: {len(sorted_subdomains)}\n\n")
+            subdomain_output.insert(tk.END, "\n".join(sorted_subdomains))
+
+            export_btn.config(state=tk.NORMAL)
+            export_btn.data = sorted_subdomains
+            analyze_btn.config(state=tk.NORMAL)
+            analyze_btn.data = sorted_subdomains
+
+            progress_var.set(0)
+
+        threading.Thread(target=discovery_task, daemon=True).start()
+
+    discover_btn = ttk.Button(button_frame, text="Discover Subdomains", command=on_discover)
+    discover_btn.pack(side=tk.LEFT, padx=5)
+
+    def export_subdomains():
+        subdomains = getattr(export_btn, 'data', [])
+        if not subdomains:
+            messagebox.showinfo("Export", "No subdomains to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
+        if file_path:
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(subdomains))
+                messagebox.showinfo("Export", f"Subdomains exported to {file_path}")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export subdomains: {str(e)}")
+
+    export_btn = ttk.Button(button_frame, text="Export Subdomains", command=export_subdomains, state=tk.DISABLED)
+    export_btn.pack(side=tk.LEFT, padx=5)
+
+    def analyze_subdomains():
+        subdomains = getattr(analyze_btn, 'data', [])
+        if not subdomains:
+            messagebox.showinfo("Analyze", "No subdomains to analyze.")
+            return
+
+        subdomain_output.insert(tk.END, "\n\n==== Analyzing Subdomains ====\n")
+
+        async def analysis_task():
+            progress_var.set(0)
+            live_domains = []
+
+            subdomain_output.insert(tk.END, "Checking subdomain liveness...\n")
+
+            async with aiohttp.ClientSession() as session:
+                tasks = [async_dns_resolve(sd) for sd in subdomains]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                live_domains = [(sd, ip) for sd, ip in zip(subdomains, results) if ip]
+
+            subdomain_output.insert(tk.END, f"Found {len(live_domains)} live subdomains\n\n")
+            for subdomain, ip in live_domains:
+                subdomain_output.insert(tk.END, f"{subdomain} ({ip})\n")
+
+            progress_var.set(0)
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(analysis_task())
+
+    analyze_btn = ttk.Button(button_frame, text="Analyze Subdomains", command=analyze_subdomains, state=tk.DISABLED)
+    analyze_btn.pack(side=tk.LEFT, padx=5)
+
+    def integrate_with_main():
+        subdomains = getattr(export_btn, 'data', [])
+        if not subdomains:
+            messagebox.showinfo("Integrate", "No subdomains to process.")
+            return
+
+        dialog = tk.Toplevel()
+        dialog.title("Select Subdomains")
+        dialog.geometry("400x300")
+
+        ttk.Label(dialog, text="Select subdomains to analyze:").pack(padx=10, pady=5)
+
+        selection_frame = ttk.Frame(dialog)
+        selection_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        subdomain_listbox = tk.Listbox(selection_frame, selectmode=tk.MULTIPLE)
+        scrollbar = ttk.Scrollbar(selection_frame, orient=tk.VERTICAL, command=subdomain_listbox.yview)
+        subdomain_listbox.config(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        subdomain_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        for subdomain in sorted(subdomains):
+            subdomain_listbox.insert(tk.END, subdomain)
+
+        def on_select():
+            selected_indices = subdomain_listbox.curselection()
+            selected_subdomains = [subdomain_listbox.get(i) for i in selected_indices]
+
+            if not selected_subdomains:
+                messagebox.showinfo("Selection", "No subdomains selected.")
+                return
+
+            main_entry.delete(0, tk.END)
+            main_entry.insert(0, f"https://{selected_subdomains[0]}")
+            dialog.destroy()
+            notebook.select(0)
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(button_frame, text="Analyze Selected", command=on_select).pack(side=tk.RIGHT)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+
+    integrate_btn = ttk.Button(button_frame, text="Send to Main Tool", command=integrate_with_main)
+    integrate_btn.pack(side=tk.LEFT, padx=5)
+
+    return subdomain_frame
+
+# Generate bucket names
+def generate_bucket_names(target: str) -> List[str]:
+    """Generate potential S3 bucket names based on target, if enabled."""
     bucket_names = []
     parsed = urlparse(target) if target.startswith("http") else None
     base_name = parsed.netloc.split('.')[0] if parsed else os.path.splitext(os.path.basename(target))[0]
@@ -466,109 +898,22 @@ def generate_bucket_names(target):
             if prefix or suffix:
                 name = f"{prefix}{base_name}{suffix}".strip("-")
                 bucket_names.append(name)
+    logging.debug(f"Generated {len(bucket_names)} potential bucket names for {target}")
     return sorted(set(bucket_names))
 
-# New: Validate bucket name
-def validate_bucket_name(name):
-    """Validate S3 bucket name per AWS naming rules."""
-    if not name or len(name) < 3 or len(name) > 63:
-        return False
-    if not re.match(r'^[a-z0-9][a-z0-9.-]*[a-z0-9]$', name):
-        return False
-    if '..' in name or '.-' in name or '-.' in name:
-        return False
-    if re.match(r'^\d+\.\d+\.\d+\.\d+$', name):
-        return False
-    return True
-
-# New: Search GitHub for buckets
-def search_github_for_buckets(target, github_pat, max_results=100):
-    """Search GitHub for S3 bucket names using the Search API."""
-    if not github_pat:
-        logging.warning("GitHub PAT not provided; skipping GitHub search.")
-        return []
-
-    parsed = urlparse(target) if target.startswith("http") else None
-    base_name = parsed.netloc.split('.')[0] if parsed else os.path.splitext(os.path.basename(target))[0]
-    search_terms = [base_name] + COMMON_BUCKET_PREFIXES
-    s3_buckets = []
-    seen_names = set()
-
-    cache_key = f"{target}:{','.join(search_terms)}"
-    if cache_key in GITHUB_CACHE:
-        logging.info(f"Using cached GitHub results for {cache_key}")
-        return GITHUB_CACHE[cache_key]
-
-    headers = {
-        "Authorization": f"Bearer {github_pat}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "S3-Bucket-Extractor/1.0"
-    }
-
-    for term in search_terms:
-        query = f'"{term} s3.amazonaws.com" OR "s3://{term}"'
-        params = {
-            "q": query,
-            "per_page": min(max_results, 100),
-            "page": 1
-        }
-        url = f"{GITHUB_API_BASE}/search/code"
-
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            if response.status_code == 403 and "rate limit" in response.text.lower():
-                logging.error("GitHub API rate limit exceeded. Try again later or use a different PAT.")
-                break
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get("incomplete_results"):
-                logging.warning(f"Incomplete GitHub search results for query: {query}")
-
-            for item in data.get("items", []):
-                repo = item["repository"]["full_name"]
-                path = item["path"]
-                file_url = item["url"]
-                file_response = requests.get(file_url, headers=headers, timeout=10)
-                if file_response.status_code != 200:
-                    logging.warning(f"Failed to fetch file {path} from {repo}")
-                    continue
-                file_data = file_response.json()
-                if "content" not in file_data:
-                    continue
-                try:
-                    content = base64.b64decode(file_data["content"]).decode("utf-8", errors="ignore")
-                except Exception as e:
-                    logging.warning(f"Failed to decode content from {path}: {str(e)}")
-                    continue
-
-                matches = s3_regex.findall(content)
-                for match in matches:
-                    bucket_name = next((m for m in match if m), None)
-                    if bucket_name and validate_bucket_name(bucket_name) and bucket_name not in seen_names:
-                        bucket_url = f"https://{bucket_name}.s3.amazonaws.com"
-                        s3_buckets.append((bucket_name, bucket_url))
-                        seen_names.add(bucket_name)
-
-            remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
-            if remaining < 5:
-                logging.warning("GitHub API rate limit nearly exhausted. Pausing search.")
-                break
-
-        except requests.RequestException as e:
-            logging.error(f"GitHub API error for query {query}: {str(e)}")
-            continue
-
-    GITHUB_CACHE[cache_key] = s3_buckets
-    logging.info(f"Found {len(s3_buckets)} potential S3 buckets via GitHub search")
-    return s3_buckets
-
-# New: Extract S3 buckets
-def extract_s3_buckets(endpoints, target="", github_pat="", use_github_search=False):
-    """Extract and generate S3 buckets, including GitHub search results."""
+# Extract S3 buckets (modified to respect generate_buckets flag)
+def extract_s3_buckets(
+    endpoints: List[str],
+    target: str = "",
+    github_pat: str = "",
+    use_github_search: bool = False,
+    generate_buckets: bool = False
+) -> List[Tuple[str, str]]:
+    """Extract S3 buckets from endpoints, with optional bucket generation."""
     s3_buckets = []
     seen_names = set()
     
+    # Extract S3 buckets directly from endpoints
     for endpoint in endpoints:
         matches = s3_regex.findall(endpoint)
         for match in matches:
@@ -576,83 +921,67 @@ def extract_s3_buckets(endpoints, target="", github_pat="", use_github_search=Fa
             if bucket_name and validate_bucket_name(bucket_name) and bucket_name not in seen_names:
                 s3_buckets.append((bucket_name, endpoint))
                 seen_names.add(bucket_name)
+                logging.debug(f"Found S3 bucket in endpoint: {bucket_name} ({endpoint})")
     
-    generated_names = generate_bucket_names(target)
-    for name in generated_names:
-        if name not in seen_names and validate_bucket_name(name):
-            for url_format in [
-                f"https://{name}.s3.amazonaws.com",
-                f"https://s3.amazonaws.com/{name}",
-                f"https://{name}.s3.us-east-1.amazonaws.com"
-            ]:
-                s3_buckets.append((name, url_format))
-                seen_names.add(name)
+    # Generate additional bucket names only if enabled
+    if generate_buckets:
+        generated_names = generate_bucket_names(target)
+        for name in generated_names:
+            if name not in seen_names and validate_bucket_name(name):
+                for url_format in [
+                    f"https://{name}.s3.amazonaws.com",
+                    f"https://s3.amazonaws.com/{name}",
+                    f"https://{name}.s3.us-east-1.amazonaws.com"
+                ]:
+                    s3_buckets.append((name, url_format))
+                    seen_names.add(name)
+                    logging.debug(f"Generated S3 bucket: {name} ({url_format})")
     
+    # Include GitHub search results if enabled
     if use_github_search and github_pat:
         github_buckets = search_github_for_buckets(target, github_pat)
         for bucket_name, bucket_url in github_buckets:
             if bucket_name not in seen_names:
                 s3_buckets.append((bucket_name, bucket_url))
                 seen_names.add(bucket_name)
+                logging.debug(f"Found S3 bucket via GitHub: {bucket_name} ({bucket_url})")
     
+    logging.info(f"Total S3 buckets extracted: {len(s3_buckets)}")
     return sorted(s3_buckets, key=lambda x: x[0])
 
-# Esprima parser
-def run_esprima_parser(input_path, node_script_path):
-    """Run Node.js Esprima parser on a JavaScript file."""
-    if not os.path.exists(input_path):
-        logging.error(f"Invalid input path for Esprima: {input_path}")
-        return []
-    
-    if not os.path.exists(node_script_path):
-        logging.error(f"Node.js script not found at: {node_script_path}")
-        return []
-    
-    try:
-        input_path = os.path.normpath(input_path)
-        node_script_path = os.path.normpath(node_script_path)
-        cmd = ["node", node_script_path, input_path]
-        logging.debug(f"Executing Esprima subprocess: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=30
-        )
-        try:
-            endpoints = json.loads(result.stdout)
-            return [ep for ep in endpoints if isinstance(ep, str) and ep.strip()]
-        except json.JSONDecodeError as e:
-            logging.error(f"Invalid JSON output from Esprima: {str(e)}")
-            return []
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Esprima subprocess failed: {e.stderr}")
-        return []
-    except subprocess.TimeoutExpired:
-        logging.error(f"Esprima subprocess timed out for {input_path}")
-        return []
-    except Exception as e:
-        logging.error(f"Esprima subprocess error: {str(e)}")
-        return []
-
-# Analyze input
-def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfinder=False, js_filter="", max_pages=100, respect_robots=True, progress_var=None, progress_bar=None, github_pat="", use_github_search=False, use_esprima=False, node_script_path=DEFAULT_NODE_SCRIPT_PATH):
+# Analyze input (modified for clearer logging)
+def analyze_input(
+    input_str: str,
+    include_all_linked: bool = False,
+    crawl_depth: int = 0,
+    use_linkfinder: bool = False,
+    js_filter: str = "",
+    max_pages: int = 100,
+    respect_robots: bool = True,
+    progress_var: Optional[tk.DoubleVar] = None,
+    progress_bar: Optional[ttk.Progressbar] = None,
+    github_pat: str = "",
+    use_github_search: bool = False,
+    use_esprima: bool = False,
+    node_script_path: str = DEFAULT_NODE_SCRIPT_PATH,
+    generate_buckets: bool = False
+) -> Tuple[List[str], List[Tuple[str, str]], Dict[str, List[str]]]:
     """Analyze input to extract endpoints and S3 buckets."""
     endpoints = []
     s3_buckets = []
     js_endpoints = {}
     
-    def process_js_content(js_code, source, file_ext=".js"):
+    def process_js_content(js_code: str, source: str, file_ext: str = ".js") -> List[str]:
         """Process JavaScript content with Esprima or fallback."""
         current_endpoints = []
+        logging.debug(f"Processing JS content from {source} (type: {file_ext})")
         if use_esprima and file_ext == ".js":
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".js", mode='w', encoding='utf-8') as temp_js:
                     temp_js.write(js_code)
                     temp_js_path = temp_js.name
                 if os.path.exists(temp_js_path) and os.path.getsize(temp_js_path) > 0:
-                    logging.debug(f"Created temporary JS file for Esprima: {temp_js_path}")
+                    logging.debug(f"Running Esprima on {temp_js_path}")
                     esprima_endpoints = run_esprima_parser(temp_js_path, node_script_path)
                     current_endpoints.extend(esprima_endpoints)
                     js_endpoints[source] = sorted(set(esprima_endpoints))
@@ -670,6 +999,7 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                         logging.error(f"Failed to delete temporary file {temp_js_path}: {str(e)}")
         else:
             current_endpoints.extend(extract_endpoints(js_code, file_ext))
+            logging.debug(f"Extracted {len(current_endpoints)} endpoints from {source} using regex")
         
         if use_linkfinder and file_ext == ".js":
             try:
@@ -677,6 +1007,7 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                     temp_js.write(js_code)
                     temp_js_path = temp_js.name
                 if os.path.exists(temp_js_path) and os.path.getsize(temp_js_path) > 0:
+                    logging.debug(f"Running LinkFinder on {temp_js_path}")
                     lf_endpoints = run_linkfinder(temp_js_path)
                     current_endpoints.extend(lf_endpoints)
                     if source in js_endpoints:
@@ -684,6 +1015,7 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                         js_endpoints[source] = sorted(set(js_endpoints[source]))
                     else:
                         js_endpoints[source] = sorted(set(lf_endpoints))
+                    logging.debug(f"LinkFinder found {len(lf_endpoints)} endpoints in {source}")
             except Exception as e:
                 logging.error(f"LinkFinder processing failed for {source}: {str(e)}")
             finally:
@@ -695,6 +1027,7 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
         
         return current_endpoints
 
+    logging.info(f"Analyzing input: {input_str}")
     if os.path.isfile(input_str):
         try:
             with open(input_str, "r", encoding="utf-8", errors="ignore") as f:
@@ -703,12 +1036,15 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                     logging.warning(f"Empty file content: {input_str}")
                     return [], [], {}
                 file_ext = os.path.splitext(input_str)[1].lower()
+                logging.debug(f"Processing file {input_str} with extension {file_ext}")
                 if file_ext == ".html":
                     js_blocks = extract_js_from_html(content)
                     content = "\n".join(js_blocks)
+                    logging.debug(f"Extracted {len(js_blocks)} JS blocks from HTML")
                 current_endpoints = process_js_content(content, input_str, file_ext)
                 endpoints.extend(current_endpoints)
-                s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search)
+                logging.info(f"Extracted {len(current_endpoints)} endpoints from file")
+                s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search, generate_buckets)
         except Exception as e:
             logging.error(f"File processing error for {input_str}: {str(e)}")
             messagebox.showerror("File Error", str(e))
@@ -721,19 +1057,22 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
         all_js_files = []
         page_count = 0
 
+        logging.debug(f"Fetching sitemap for {input_str}")
         sitemap_urls = parse_sitemap(input_str)
         for s_url in sitemap_urls:
             if urlparse(s_url).netloc == base_domain and s_url not in visited:
                 queue.append((s_url, 0))
                 to_process.append((s_url, 0))
+        logging.debug(f"Found {len(sitemap_urls)} sitemap URLs")
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             while queue and page_count < max_pages:
                 url, depth = queue.popleft()
                 if url in visited or depth > crawl_depth:
                     continue
                 visited.add(url)
                 page_count += 1
+                logging.debug(f"Processing URL {url} (depth {depth}, page {page_count}/{max_pages})")
 
                 future = executor.submit(fetch_url_content, url, respect_robots)
                 html_content, info = future.result()
@@ -743,13 +1082,17 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
 
                 current_endpoints = []
                 file_ext = ".html" if "html" in info.lower() else ".js" if "javascript" in info.lower() else ""
+                logging.debug(f"Content type for {url}: {info}")
                 if file_ext == ".html":
                     js_blocks = extract_js_from_html(html_content, url, extract_urls=include_all_linked)
                     linked_sources = [s for s in js_blocks if s.startswith("http") and s.endswith(".js")]
                     inline_scripts = [s for s in js_blocks if not s.startswith("http")]
+                    logging.debug(f"Found {len(linked_sources)} linked JS files and {len(inline_scripts)} inline scripts")
 
                     for script in inline_scripts:
-                        current_endpoints.extend(process_js_content(script, f"{url}:inline", ".js"))
+                        script_endpoints = process_js_content(script, f"{url}:inline", ".js")
+                        current_endpoints.extend(script_endpoints)
+                        logging.debug(f"Extracted {len(script_endpoints)} endpoints from inline script")
 
                     if include_all_linked and linked_sources:
                         filtered_js_files = filter_js_files(linked_sources, js_filter)
@@ -764,9 +1107,11 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                                 js_file_endpoints = process_js_content(js_code, js_url, ".js")
                                 current_endpoints.extend(js_file_endpoints)
                                 all_js_files.append(js_url)
+                                logging.debug(f"Extracted {len(js_file_endpoints)} endpoints from {js_url}")
                 else:
                     current_endpoints = process_js_content(html_content, url, file_ext)
                     all_js_files.append(url)
+                    logging.debug(f"Extracted {len(current_endpoints)} endpoints from {url}")
 
                 endpoints.extend(current_endpoints)
 
@@ -777,95 +1122,111 @@ def analyze_input(input_str, include_all_linked=False, crawl_depth=0, use_linkfi
                     progress_bar.update()
 
         endpoints = sorted(set(endpoints))
-        s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search)
         logging.info(f"Processed {len(all_js_files)} JS files, found {len(endpoints)} total endpoints")
+        s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search, generate_buckets)
     else:
         messagebox.showerror("Invalid Input", "Please enter a valid file path or URL.")
         return [], [], {}
 
     return endpoints, s3_buckets, js_endpoints
 
-# GUI
+# GUI (modified to add S3 bucket generation toggle)
 def create_gui():
     root = tk.Tk()
-    root.title("S3 Bucket and Endpoint Extractor with LinkFinder and GitHub Search")
-    root.geometry("900x850")
+    root.title("S3 Bucket and Endpoint Extractor")
+    root.geometry("1800x900")
 
-    config_frame = tk.Frame(root)
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True)
+
+    main_frame = ttk.Frame(notebook)
+    notebook.add(main_frame, text="Endpoint Discovery")
+
+    config_frame = ttk.Frame(main_frame)
     config_frame.pack(padx=10, pady=5, fill=tk.X)
     
-    tk.Label(config_frame, text="LinkFinder Path:").pack(side=tk.LEFT)
     config = load_config()
-    linkfinder_entry = tk.Entry(config_frame, width=20)
+    ttk.Label(config_frame, text="LinkFinder Path:").pack(side=tk.LEFT)
+    linkfinder_entry = ttk.Entry(config_frame, width=20)
     linkfinder_entry.insert(0, config.get("linkfinder_path", DEFAULT_LINKFINDER_PATH))
     linkfinder_entry.pack(side=tk.LEFT, padx=(0, 5))
-    browse_linkfinder_btn = tk.Button(config_frame, text="Browse", command=lambda: on_browse_linkfinder(linkfinder_entry))
-    browse_linkfinder_btn.pack(side=tk.LEFT)
+    ttk.Button(config_frame, text="Browse", command=lambda: on_browse_linkfinder(linkfinder_entry)).pack(side=tk.LEFT)
     
-    tk.Label(config_frame, text="Node.js Script:").pack(side=tk.LEFT, padx=5)
-    node_script_entry = tk.Entry(config_frame, width=20)
+    ttk.Label(config_frame, text="Node.js Script:").pack(side=tk.LEFT, padx=5)
+    node_script_entry = ttk.Entry(config_frame, width=20)
     node_script_entry.insert(0, config.get("node_script_path", DEFAULT_NODE_SCRIPT_PATH))
     node_script_entry.pack(side=tk.LEFT, padx=(0, 5))
-    browse_node_btn = tk.Button(config_frame, text="Browse", command=lambda: on_browse_node_script(node_script_entry))
-    browse_node_btn.pack(side=tk.LEFT)
+    ttk.Button(config_frame, text="Browse", command=lambda: on_browse_node_script(node_script_entry)).pack(side=tk.LEFT)
     
-    tk.Label(config_frame, text="GitHub PAT:").pack(side=tk.LEFT, padx=5)
-    github_pat_entry = tk.Entry(config_frame, width=20, show="*")
+    ttk.Label(config_frame, text="GitHub PAT:").pack(side=tk.LEFT, padx=5)
+    github_pat_entry = ttk.Entry(config_frame, width=20, show="*")
     github_pat_entry.insert(0, config.get("github_pat", ""))
     github_pat_entry.pack(side=tk.LEFT, padx=(0, 5))
 
-    input_frame = tk.Frame(root)
+    input_frame = ttk.Frame(main_frame)
     input_frame.pack(padx=10, pady=5, fill=tk.X)
-    tk.Label(input_frame, text="URL/File:").pack(side=tk.LEFT)
-    entry = tk.Entry(input_frame, width=50)
+    ttk.Label(input_frame, text="URL/File:").pack(side=tk.LEFT)
+    entry = ttk.Entry(input_frame, width=50)
     entry.pack(side=tk.LEFT, padx=(0, 5), expand=True, fill=tk.X)
-    browse_btn = tk.Button(input_frame, text="Browse", command=lambda: on_browse(entry))
-    browse_btn.pack(side=tk.LEFT)
+    ttk.Button(input_frame, text="Browse", command=lambda: on_browse(entry)).pack(side=tk.LEFT)
 
-    crawl_frame = tk.Frame(root)
+    crawl_frame = ttk.Frame(main_frame)
     crawl_frame.pack(padx=10, pady=5, fill=tk.X)
-    tk.Label(crawl_frame, text="Crawl Depth:").pack(side=tk.LEFT)
-    depth_entry = tk.Spinbox(crawl_frame, from_=0, to=10, width=5)
+    ttk.Label(crawl_frame, text="Crawl Depth:").pack(side=tk.LEFT)
+    depth_entry = ttk.Spinbox(crawl_frame, from_=0, to=10, width=5)
     depth_entry.pack(side=tk.LEFT, padx=5)
-    tk.Label(crawl_frame, text="Max Pages:").pack(side=tk.LEFT, padx=5)
-    max_pages_entry = tk.Spinbox(crawl_frame, from_=1, to=1000, width=5)
+    ttk.Label(crawl_frame, text="Max Pages:").pack(side=tk.LEFT, padx=5)
+    max_pages_entry = ttk.Spinbox(crawl_frame, from_=1, to=1000, width=5)
     max_pages_entry.delete(0, tk.END)
     max_pages_entry.insert(0, "100")
     max_pages_entry.pack(side=tk.LEFT, padx=5)
-    tk.Label(crawl_frame, text="(Depth 0 = input only; Max pages limits crawl)").pack(side=tk.LEFT)
+    ttk.Label(crawl_frame, text="(Depth 0 = input only; Max pages limits crawl)").pack(side=tk.LEFT)
 
-    js_filter_frame = tk.Frame(root)
+    js_filter_frame = ttk.Frame(main_frame)
     js_filter_frame.pack(padx=10, pady=5, fill=tk.X)
-    tk.Label(js_filter_frame, text="JS File Filter (e.g., *.min.js):").pack(side=tk.LEFT)
-    js_filter_entry = tk.Entry(js_filter_frame, width=20)
+    ttk.Label(js_filter_frame, text="JS File Filter (e.g., *.min.js):").pack(side=tk.LEFT)
+    js_filter_entry = ttk.Entry(js_filter_frame, width=20)
     js_filter_entry.pack(side=tk.LEFT, padx=5)
-    tk.Label(js_filter_frame, text="(Leave blank for all JS files)").pack(side=tk.LEFT)
+    ttk.Label(js_filter_frame, text="(Leave blank for all JS files)").pack(side=tk.LEFT)
 
-    options_frame = tk.Frame(root)
+    subdomain_tab = create_subdomain_tab(notebook, entry)
+    
+    results_tab = ttk.Frame(notebook)
+    notebook.add(results_tab, text="Consolidated Results")
+    results_output = scrolledtext.ScrolledText(results_tab, wrap=tk.WORD, width=80, height=20)
+    results_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    options_frame = ttk.Frame(main_frame)
     options_frame.pack(padx=10, pady=5, fill=tk.X)
     linkfinder_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
+    ttk.Checkbutton(
         options_frame,
         text="Use LinkFinder for JS endpoint extraction",
         variable=linkfinder_var
     ).pack(side=tk.LEFT, padx=5)
     respect_robots_var = tk.BooleanVar(value=config.get("respect_robots", True))
-    tk.Checkbutton(
+    ttk.Checkbutton(
         options_frame,
         text="Respect robots.txt (recommended for ethical crawling)",
         variable=respect_robots_var
     ).pack(side=tk.LEFT, padx=5)
     use_github_search_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
+    ttk.Checkbutton(
         options_frame,
         text="Search GitHub for S3 buckets (requires PAT, use ethically)",
         variable=use_github_search_var
     ).pack(side=tk.LEFT, padx=5)
     use_esprima_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
+    ttk.Checkbutton(
         options_frame,
         text="Use Esprima for advanced JS parsing (requires Node.js)",
         variable=use_esprima_var
+    ).pack(side=tk.LEFT, padx=5)
+    generate_buckets_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        options_frame,
+        text="Generate potential S3 bucket names (may produce unrelated results)",
+        variable=generate_buckets_var
     ).pack(side=tk.LEFT, padx=5)
 
     def on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=False):
@@ -909,9 +1270,11 @@ def create_gui():
         js_filter = js_filter_entry.get().strip()
         respect_robots = respect_robots_var.get()
         use_github_search = use_github_search_var.get()
+        generate_buckets = generate_buckets_var.get()
 
         def extraction_task():
             output_area.delete(1.0, tk.END)
+            output_area.insert(tk.END, f"Analyzing {input_val}...\n\n")
             endpoints, s3_buckets, js_endpoints = analyze_input(
                 input_val,
                 include_all_linked=include_all_linked,
@@ -925,7 +1288,8 @@ def create_gui():
                 github_pat=github_pat,
                 use_github_search=use_github_search,
                 use_esprima=use_esprima,
-                node_script_path=node_script_path
+                node_script_path=node_script_path,
+                generate_buckets=generate_buckets
             )
 
             output_area.insert(tk.END, "=== JavaScript Files and Endpoints ===\n")
@@ -951,6 +1315,10 @@ def create_gui():
             else:
                 output_area.insert(tk.END, "No S3 buckets found.\n")
 
+            results_output.delete(1.0, tk.END)
+            results_output.insert(tk.END, f"Results for {input_val}\n\n")
+            results_output.insert(tk.END, output_area.get(1.0, tk.END))
+
             export_s3_btn.data = s3_buckets
             export_all_btn.data = (input_val, endpoints, s3_buckets, js_endpoints)
             export_js_btn.data = js_endpoints
@@ -966,52 +1334,52 @@ def create_gui():
 
         threading.Thread(target=extraction_task, daemon=True).start()
 
-    button_frame = tk.Frame(root)
+    button_frame = ttk.Frame(main_frame)
     button_frame.pack(pady=5)
-    global export_s3_btn, export_all_btn, export_js_btn, export_html_btn
-    extract_btn = tk.Button(
-        button_frame,
-        text="Extract Inline",
-        command=lambda: on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, False)
-    )
-    extract_btn.pack(side=tk.LEFT, padx=5)
-    extract_all_btn = tk.Button(
-        button_frame,
-        text="Extract All JS (linked too)",
-        command=lambda: on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, True)
-    )
-    extract_all_btn.pack(side=tk.LEFT, padx=5)
-    export_s3_btn = tk.Button(button_frame, text="Export S3 Results", state=tk.DISABLED,
+    export_s3_btn = ttk.Button(button_frame, text="Export S3 Results", state=tk.DISABLED,
                               command=lambda: export_s3_results(getattr(export_s3_btn, 'data', [])))
-    export_s3_btn.pack(side=tk.LEFT, padx=5)
-    export_all_btn = tk.Button(
+    export_all_btn = ttk.Button(
         button_frame,
         text="Export JSON",
         state=tk.DISABLED,
         command=lambda: export_all_results(*getattr(export_all_btn, 'data', ('', [], [], {})))
     )
-    export_all_btn.pack(side=tk.LEFT, padx=5)
-    export_js_btn = tk.Button(
+    export_js_btn = ttk.Button(
         button_frame,
         text="Export JS Endpoints",
         state=tk.DISABLED,
         command=lambda: export_js_endpoints(getattr(export_js_btn, 'data', {})))
-    export_js_btn.pack(side=tk.LEFT, padx=5)
-    export_html_btn = tk.Button(
+    export_html_btn = ttk.Button(
         button_frame,
         text="Export HTML Report",
         state=tk.DISABLED,
         command=lambda: export_html_report(*getattr(export_html_btn, 'data', ('', [], [], {})))
     )
+    extract_btn = ttk.Button(
+        button_frame,
+        text="Extract Inline",
+        command=lambda: on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, False)
+    )
+    extract_all_btn = ttk.Button(
+        button_frame,
+        text="Extract All JS (linked too)",
+        command=lambda: on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, True)
+    )
+    extract_btn.pack(side=tk.LEFT, padx=5)
+    extract_all_btn.pack(side=tk.LEFT, padx=5)
+    export_s3_btn.pack(side=tk.LEFT, padx=5)
+    export_all_btn.pack(side=tk.LEFT, padx=5)
+    export_js_btn.pack(side=tk.LEFT, padx=5)
     export_html_btn.pack(side=tk.LEFT, padx=5)
 
     progress_var = tk.DoubleVar()
-    progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100)
+    progress_bar = ttk.Progressbar(main_frame, variable=progress_var, maximum=100)
     progress_bar.pack(fill=tk.X, padx=10, pady=5)
 
-    output_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=100, height=25)
+    output_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=100, height=25)
     output_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
+    load_cache()
     root.mainloop()
 
 if __name__ == "__main__":
