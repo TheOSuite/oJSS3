@@ -63,13 +63,14 @@ COMMON_BUCKET_PREFIXES = [
 regex = re.compile(
     r"""
     (?:"|')(
-        (([a-zA-Z]{1,10}://|//)[^"'/]{1,}\.[a-zA-Z]{2,}[^"']*) |
-        ((/|\.\./|\./)[^"'><,;|*()%$^/\\\[\]][^"'><,;|()*()%$^/\\\[\]]+) |
-        ([a-zA-Z0-9_\-/]{1,}/[a-zA-Z0-9_\-/]{1,}\.(php|asp|aspx|jsp|json|html|js|txt|xml)) |
-        ([a-zA-Z0-9_\-]{1,}=\w+)
+        # Match full URLs with /api/ or relative paths with /api/
+        ((https?://example\.com)?/api/[a-zA-Z0-9_\-/]+(?:\?[a-zA-Z0-9_\-&=]*)?) |
+        # Optionally include other API-like prefixes (e.g., /rest/, /v1/)
+        ((https?://example\.com)?/(rest|v[0-9]+|graphql)/[a-zA-Z0-9_\-/]+(?:\?[a-zA-Z0-9_\-&=]*)?)
     )(?:"|')
+    (?!\.(css|js|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot))  # Exclude static assets
     """,
-    re.VERBOSE,
+    re.VERBOSE | re.IGNORECASE,
 )
 
 # Regex for S3 buckets
@@ -203,15 +204,17 @@ def fetch_url_content(url: str, respect_robots: bool = True) -> Tuple[Optional[s
 
 # Extract JS from HTML
 def extract_js_from_html(html_content: str, base_url: str = "", extract_urls: bool = False) -> List[str]:
-    """Extract JavaScript code or URLs from HTML."""
+    """Extract JavaScript code or URLs from HTML, including potential JS files."""
     js_blocks = []
     try:
         soup = BeautifulSoup(html_content, "html.parser")
+        # Extract inline scripts
         for script in soup.find_all("script", src=False):
             if script.string:
                 beautified = jsbeautifier.beautify(script.string.strip())
                 if beautified:
                     js_blocks.append(beautified)
+        # Extract linked scripts and other potential JS files
         if extract_urls:
             for script in soup.find_all("script", src=True):
                 src = script.get("src")
@@ -219,6 +222,12 @@ def extract_js_from_html(html_content: str, base_url: str = "", extract_urls: bo
                     absolute_url = urljoin(base_url, src)
                     if absolute_url.endswith(".js"):
                         js_blocks.append(absolute_url)
+            # Extract links to potential JS files from <a> tags and other sources
+            for link in soup.find_all("a", href=True):
+                href = link.get("href")
+                if href and href.endswith(".js"):
+                    absolute_url = urljoin(base_url, href)
+                    js_blocks.append(absolute_url)
     except Exception as e:
         logging.error(f"Error extracting JS from HTML: {str(e)}")
     return js_blocks
@@ -380,6 +389,58 @@ def export_js_endpoints(js_endpoints: Dict[str, List[str]]) -> None:
             messagebox.showinfo("Export", f"JS endpoints exported to {file_path}")
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export JS endpoints: {str(e)}")
+
+def run_esprima_parser(js_file_path: str, node_script_path: str) -> List[str]:
+    """Run the Node.js Esprima parser script on a JavaScript file."""
+    endpoints = []
+    try:
+        if not os.path.exists(node_script_path):
+            logging.error(f"Node.js script not found at {node_script_path}")
+            return endpoints
+        if not os.path.exists(js_file_path):
+            logging.error(f"JavaScript file not found at {js_file_path}")
+            return endpoints
+
+        cmd = ["node", node_script_path, js_file_path]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',  # Explicitly use UTF-8
+            errors='replace',  # Replace invalid characters
+            check=True,
+            timeout=30
+        )
+        output = result.stdout.strip()
+        endpoints = [line for line in output.splitlines() if line.strip() and line.startswith("http")]
+        logging.info(f"Esprima parser processed {js_file_path}, found {len(endpoints)} endpoints")
+    except subprocess.CalledProcessError as e:
+        if "MODULE_NOT_FOUND" in e.stderr:
+            logging.error(f"Esprima module not found. Run 'npm install esprima' in {os.path.dirname(node_script_path)}")
+        else:
+            logging.error(f"Esprima subprocess failed for {js_file_path}: {e.stderr}")
+        logging.debug(f"Esprima stdout: {e.stdout}")
+    except UnicodeDecodeError as e:
+        logging.error(f"Unicode decode error in Esprima output for {js_file_path}: {str(e)}")
+        logging.debug(f"Attempting to read raw output as bytes")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,  # Read as bytes
+                check=True,
+                timeout=30
+            )
+            output = result.stdout.decode('utf-8', errors='replace').strip()
+            endpoints = [line for line in output.splitlines() if line.strip() and line.startswith("http")]
+            logging.info(f"Esprima parser (bytes fallback) processed {js_file_path}, found {len(endpoints)} endpoints")
+        except Exception as e2:
+            logging.error(f"Bytes fallback failed for {js_file_path}: {str(e2)}")
+    except subprocess.TimeoutExpired:
+        logging.error(f"Esprima subprocess timed out for {js_file_path}")
+    except Exception as e:
+        logging.error(f"Esprima processing error for {js_file_path}: {str(e)}")
+    return endpoints
 
 def export_html_report(input_val: str, endpoints: List[str], s3_buckets: List[Tuple[str, str]], js_endpoints: Dict[str, List[str]]) -> None:
     """Export results to an HTML report."""
@@ -640,250 +701,242 @@ def attempt_zone_transfer(domain: str) -> List[str]:
     return list(subdomains)
 
 def create_subdomain_tab(notebook: ttk.Notebook, main_entry: tk.Entry) -> ttk.Frame:
-    """Create the subdomain discovery tab in the UI."""
+    # ── 1) SETUP FRAME ─────────────────────────────────────────
     subdomain_frame = ttk.Frame(notebook)
     notebook.add(subdomain_frame, text="Subdomain Discovery")
 
-    # Domain input
-    domain_frame = ttk.Frame(subdomain_frame)
-    domain_frame.pack(fill=tk.X, padx=10, pady=5)
-    ttk.Label(domain_frame, text="Domain:").pack(side=tk.LEFT)
-    domain_entry = ttk.Entry(domain_frame, width=30)
-    domain_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-    # Method selection
-    method_frame = ttk.Frame(subdomain_frame)
-    method_frame.pack(fill=tk.X, padx=10, pady=5)
-    ttk.Label(method_frame, text="Discovery Methods:").pack(side=tk.LEFT)
-
+    # Define BooleanVars for discovery methods
     ct_logs_var = tk.BooleanVar(value=True)
-    dns_db_var = tk.BooleanVar(value=True)
-    securitytrails_var = tk.BooleanVar(value=False)
     bruteforce_var = tk.BooleanVar(value=False)
+    dns_dbs_var = tk.BooleanVar(value=True)
+    securitytrails_var = tk.BooleanVar(value=False)
     zone_transfer_var = tk.BooleanVar(value=False)
 
-    ttk.Checkbutton(method_frame, text="Certificate Transparency", variable=ct_logs_var).pack(side=tk.LEFT, padx=5)
-    ttk.Checkbutton(method_frame, text="DNS Databases", variable=dns_db_var).pack(side=tk.LEFT, padx=5)
-    ttk.Checkbutton(method_frame, text="SecurityTrails API", variable=securitytrails_var).pack(side=tk.LEFT, padx=5)
-    ttk.Checkbutton(method_frame, text="Bruteforce", variable=bruteforce_var).pack(side=tk.LEFT, padx=5)
-    ttk.Checkbutton(method_frame, text="Zone Transfer", variable=zone_transfer_var).pack(side=tk.LEFT, padx=5)
 
-    # API Key configuration
-    api_frame = ttk.Frame(subdomain_frame)
-    api_frame.pack(fill=tk.X, padx=10, pady=5)
-    ttk.Label(api_frame, text="SecurityTrails API Key:").pack(side=tk.LEFT)
-    api_key_entry = ttk.Entry(api_frame, width=40, show="*")
-    api_key_entry.pack(side=tk.LEFT, padx=5)
-
-    # Wordlist for bruteforce
-    wordlist_frame = ttk.Frame(subdomain_frame)
-    wordlist_frame.pack(fill=tk.X, padx=10, pady=5)
-    ttk.Label(wordlist_frame, text="Bruteforce Wordlist:").pack(side=tk.LEFT)
-    wordlist_entry = ttk.Entry(wordlist_frame, width=40)
-    wordlist_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-    ttk.Button(wordlist_frame, text="Browse", 
-               command=lambda: wordlist_entry.insert(0, filedialog.askopenfilename(
-                   filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-               ))).pack(side=tk.LEFT)
-
-    # Output area
-    output_frame = ttk.Frame(subdomain_frame)
-    output_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-    subdomain_output = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, width=80, height=20)
-    subdomain_output.pack(fill=tk.BOTH, expand=True)
-
-    # Progress bar
-    progress_var = tk.DoubleVar()
-    progress_bar = ttk.Progressbar(subdomain_frame, variable=progress_var, maximum=100)
-    progress_bar.pack(fill=tk.X, padx=10, pady=5)
-
-    # Action buttons
-    button_frame = ttk.Frame(subdomain_frame)
-    button_frame.pack(fill=tk.X, padx=10, pady=5)
-
+    # ── 2) DEFINE CALLBACKS ───────────────────────────────────
     def validate_domain(domain: str) -> bool:
-        """Validate domain name format."""
-        return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$', domain))
+        return bool(re.match(
+            r'^[a-zA-Z0-9][a-zA-Z0-9.-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$',
+            domain)
+        )
 
     def on_discover():
         domain = domain_entry.get().strip()
-        if not domain or not validate_domain(domain):
-            messagebox.showerror("Error", "Please enter a valid domain name (e.g., example.com)")
+        if not validate_domain(domain):
+            messagebox.showerror("Error", "Please enter a valid domain (e.g. example.com)")
             return
 
-        subdomain_output.delete(1.0, tk.END)
+        # clear & header
+        subdomain_output.delete("1.0", tk.END)
         subdomain_output.insert(tk.END, f"Discovering subdomains for {domain}...\n\n")
-        discovered = set()
+        subdomain_output.see(tk.END) # Scroll to the end
 
-        def discovery_task():
-            total_methods = sum([
-                ct_logs_var.get(), 
-                dns_db_var.get(), 
-                securitytrails_var.get(), 
-                bruteforce_var.get(), 
-                zone_transfer_var.get()
-            ])
-            methods_completed = 0
+        discovered = set()
+        wordlist_path = wordlist_entry.get().strip() or DEFAULT_WORDLIST # Get wordlist path
+        securitytrails_api_key = securitytrails_api_key_entry.get().strip() # Get SecurityTrails API Key
+
+
+        def worker():
+            # Function to safely update the GUI from the worker thread
+            def update_output(message):
+                subdomain_output.insert(tk.END, message)
+                subdomain_output.see(tk.END)
 
             if ct_logs_var.get():
-                subdomain_output.insert(tk.END, "Querying Certificate Transparency logs...\n")
-                subdomains = query_certificate_transparency(domain)
-                discovered.update(subdomains)
-                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via CT logs\n\n")
-                methods_completed += 1
-                progress_var.set((methods_completed / total_methods) * 100)
+                root.after(0, update_output, "Querying Certificate Transparency logs...\n")
+                try:
+                    ct_subs = query_certificate_transparency(domain)
+                    discovered.update(ct_subs)
+                    root.after(0, update_output, f"Found {len(ct_subs)} subdomains via CT logs.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error querying CT logs: {str(e)}\n")
 
-            if dns_db_var.get():
-                subdomain_output.insert(tk.END, "Querying DNS databases...\n")
-                subdomains = query_dns_dbs(domain)
-                discovered.update(subdomains)
-                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via DNS databases\n\n")
-                methods_completed += 1
-                progress_var.set((methods_completed / total_methods) * 100)
-
-            if securitytrails_var.get():
-                api_key = api_key_entry.get().strip()
-                if api_key:
-                    subdomain_output.insert(tk.END, "Querying SecurityTrails API...\n")
-                    subdomains = query_securitytrails(domain, api_key)
-                    discovered.update(subdomains)
-                    subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via SecurityTrails\n\n")
-                else:
-                    subdomain_output.insert(tk.END, "SecurityTrails API key not provided, skipping...\n\n")
-                methods_completed += 1
-                progress_var.set((methods_completed / total_methods) * 100)
 
             if bruteforce_var.get():
-                wordlist = wordlist_entry.get().strip()
-                subdomain_output.insert(tk.END, "Bruteforcing subdomains...\n")
-                subdomains = dns_bruteforce(domain, wordlist)
-                discovered.update(subdomains)
-                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via bruteforce\n\n")
-                methods_completed += 1
-                progress_var.set((methods_completed / total_methods) * 100)
+                root.after(0, update_output, f"Starting DNS bruteforce with {wordlist_path}...\n")
+                try:
+                    brute_subs = dns_bruteforce(domain, wordlist_path)
+                    discovered.update(brute_subs)
+                    root.after(0, update_output, f"Found {len(brute_subs)} subdomains via bruteforce.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error during bruteforce: {str(e)}\n")
+
+
+            if dns_dbs_var.get():
+                root.after(0, update_output, "Querying DNS databases...\n")
+                try:
+                    db_subs = query_dns_dbs(domain)
+                    discovered.update(db_subs)
+                    root.after(0, update_output, f"Found {len(db_subs)} subdomains via DNS databases.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error querying DNS databases: {str(e)}\n")
+
+
+            if securitytrails_var.get():
+                if securitytrails_api_key:
+                    root.after(0, update_output, "Querying SecurityTrails...\n")
+                    try:
+                        st_subs = query_securitytrails(domain, securitytrails_api_key)
+                        discovered.update(st_subs)
+                        root.after(0, update_output, f"Found {len(st_subs)} subdomains via SecurityTrails.\n")
+                    except Exception as e:
+                        root.after(0, update_output, f"Error querying SecurityTrails: {str(e)}\n")
+                else:
+                     root.after(0, update_output, "Skipping SecurityTrails query: API key not provided.\n")
+
 
             if zone_transfer_var.get():
-                subdomain_output.insert(tk.END, "Attempting zone transfers...\n")
-                subdomains = attempt_zone_transfer(domain)
-                discovered.update(subdomains)
-                subdomain_output.insert(tk.END, f"Found {len(subdomains)} subdomains via zone transfer\n\n")
-                methods_completed += 1
-                progress_var.set((methods_completed / total_methods) * 100)
+                root.after(0, update_output, "Attempting DNS zone transfer...\n")
+                try:
+                    zt_subs = attempt_zone_transfer(domain)
+                    discovered.update(zt_subs)
+                    root.after(0, update_output, f"Found {len(zt_subs)} subdomains via zone transfer.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error during zone transfer attempt: {str(e)}\n")
 
-            sorted_subdomains = sorted(list(discovered))
-            subdomain_output.insert(tk.END, f"==== Discovery Complete ====\n")
-            subdomain_output.insert(tk.END, f"Total unique subdomains found: {len(sorted_subdomains)}\n\n")
-            subdomain_output.insert(tk.END, "\n".join(sorted_subdomains))
 
-            export_btn.config(state=tk.NORMAL)
-            export_btn.data = sorted_subdomains
-            analyze_btn.config(state=tk.NORMAL)
-            analyze_btn.data = sorted_subdomains
+            results = sorted(list(discovered))
 
-            progress_var.set(0)
+            # display results in the main output area
+            root.after(0, subdomain_output.insert, tk.END, "\n=== Complete ===\n")
+            root.after(0, subdomain_output.insert, tk.END, f"Total unique subdomains found: {len(results)}\n")
+            root.after(0, subdomain_output.insert, tk.END, "\n".join(results) + "\n")
+            root.after(0, subdomain_output.see, tk.END)
 
-        threading.Thread(target=discovery_task, daemon=True).start()
 
-    discover_btn = ttk.Button(button_frame, text="Discover Subdomains", command=on_discover)
-    discover_btn.pack(side=tk.LEFT, padx=5)
+            # enable the other buttons (update in the main thread)
+            root.after(0, export_btn.config, state=tk.NORMAL)
+            root.after(0, analyze_btn.config, state=tk.NORMAL)
+            root.after(0, search_btn.config, state=tk.NORMAL)
+            search_btn.data = results # Store results for searching and exporting (can be done in worker thread)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def on_search(event=None):
+        all_subs = getattr(search_btn, "data", [])
+        if not all_subs:
+            return
+
+        q = search_entry.get().strip().lower()
+        if not q:
+            filtered = all_subs
+        else:
+            filtered = [s for s in all_subs if q in s.lower()]
+
+        # Clear and display filtered results
+        subdomain_output.delete("1.0", tk.END)
+        if filtered:
+            subdomain_output.insert(tk.END, f"Found {len(filtered)} matching subdomains:\n\n")
+            subdomain_output.insert(tk.END, "\n".join(filtered) + "\n")
+        else:
+            subdomain_output.insert(tk.END, "No matching subdomains found.\n")
+        subdomain_output.see(tk.END)
+
 
     def export_subdomains():
-        subdomains = getattr(export_btn, 'data', [])
-        if not subdomains:
+        subs = getattr(search_btn, "data", [])
+        if not subs:
             messagebox.showinfo("Export", "No subdomains to export.")
             return
+        path = filedialog.asksaveasfilename(defaultextension=".txt")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(subs))
+            messagebox.showinfo("Export", f"Saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export subdomains: {str(e)}")
 
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        if file_path:
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(subdomains))
-                messagebox.showinfo("Export", f"Subdomains exported to {file_path}")
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Failed to export subdomains: {str(e)}")
-
-    export_btn = ttk.Button(button_frame, text="Export Subdomains", command=export_subdomains, state=tk.DISABLED)
-    export_btn.pack(side=tk.LEFT, padx=5)
 
     def analyze_subdomains():
-        subdomains = getattr(analyze_btn, 'data', [])
-        if not subdomains:
+        subs = getattr(search_btn, "data", [])
+        if not subs:
             messagebox.showinfo("Analyze", "No subdomains to analyze.")
             return
+        # Placeholder for liveness checks or other analysis
+        messagebox.showinfo("Analyze", f"Analyzing {len(subs)} subdomains (Analysis not fully implemented).")
 
-        subdomain_output.insert(tk.END, "\n\n==== Analyzing Subdomains ====\n")
-
-        async def analysis_task():
-            progress_var.set(0)
-            live_domains = []
-
-            subdomain_output.insert(tk.END, "Checking subdomain liveness...\n")
-
-            async with aiohttp.ClientSession() as session:
-                tasks = [async_dns_resolve(sd) for sd in subdomains]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                live_domains = [(sd, ip) for sd, ip in zip(subdomains, results) if ip]
-
-            subdomain_output.insert(tk.END, f"Found {len(live_domains)} live subdomains\n\n")
-            for subdomain, ip in live_domains:
-                subdomain_output.insert(tk.END, f"{subdomain} ({ip})\n")
-
-            progress_var.set(0)
-
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(analysis_task())
-
-    analyze_btn = ttk.Button(button_frame, text="Analyze Subdomains", command=analyze_subdomains, state=tk.DISABLED)
-    analyze_btn.pack(side=tk.LEFT, padx=5)
 
     def integrate_with_main():
-        subdomains = getattr(export_btn, 'data', [])
-        if not subdomains:
-            messagebox.showinfo("Integrate", "No subdomains to process.")
+        subs = getattr(search_btn, "data", [])
+        if not subs:
+            messagebox.showinfo("Integrate", "No subdomains to send.")
             return
-
-        dialog = tk.Toplevel()
-        dialog.title("Select Subdomains")
-        dialog.geometry("400x300")
-
-        ttk.Label(dialog, text="Select subdomains to analyze:").pack(padx=10, pady=5)
-
-        selection_frame = ttk.Frame(dialog)
-        selection_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        subdomain_listbox = tk.Listbox(selection_frame, selectmode=tk.MULTIPLE)
-        scrollbar = ttk.Scrollbar(selection_frame, orient=tk.VERTICAL, command=subdomain_listbox.yview)
-        subdomain_listbox.config(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        subdomain_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        for subdomain in sorted(subdomains):
-            subdomain_listbox.insert(tk.END, subdomain)
-
-        def on_select():
-            selected_indices = subdomain_listbox.curselection()
-            selected_subdomains = [subdomain_listbox.get(i) for i in selected_indices]
-
-            if not selected_subdomains:
-                messagebox.showinfo("Selection", "No subdomains selected.")
-                return
-
+        # Example: pick the first subdomain and insert into the main tab’s entry:
+        if subs:
             main_entry.delete(0, tk.END)
-            main_entry.insert(0, f"https://{selected_subdomains[0]}")
-            dialog.destroy()
-            notebook.select(0)
+            # Prepend https:// for consistency if it's a URL input field
+            main_entry.insert(0, f"https://{subs[0]}")
+            notebook.select(0)  # switch back to main tab
+        else:
+             messagebox.showinfo("Integrate", "No subdomains to send.")
 
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(button_frame, text="Analyze Selected", command=on_select).pack(side=tk.RIGHT)
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
 
-    integrate_btn = ttk.Button(button_frame, text="Send to Main Tool", command=integrate_with_main)
-    integrate_btn.pack(side=tk.LEFT, padx=5)
+    # ── 3) DOMAIN ENTRY AND OPTIONS ────────────────────────────
+    domain_frame = ttk.Frame(subdomain_frame)
+    domain_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(domain_frame, text="Target Domain:").pack(side=tk.LEFT)
+    domain_entry = ttk.Entry(domain_frame, width=40)
+    domain_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    # Add SecurityTrails API Key Entry
+    securitytrails_frame = ttk.Frame(subdomain_frame)
+    securitytrails_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(securitytrails_frame, text="SecurityTrails API Key:").pack(side=tk.LEFT)
+    securitytrails_api_key_entry = ttk.Entry(securitytrails_frame, width=40, show="*")
+    securitytrails_api_key_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+     # Optional: Load API key from config if you add it there
+
+    # Add Wordlist Entry
+    wordlist_frame = ttk.Frame(subdomain_frame)
+    wordlist_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(wordlist_frame, text="Wordlist Path (for bruteforce):").pack(side=tk.LEFT)
+    wordlist_entry = ttk.Entry(wordlist_frame, width=40)
+    wordlist_entry.insert(0, DEFAULT_WORDLIST) # Default path
+    wordlist_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    ttk.Button(wordlist_frame, text="Browse", command=lambda: on_browse(wordlist_entry)).pack(side=tk.LEFT)
+
+
+    # Add Checkboxes for Discovery Methods
+    methods_frame = ttk.Frame(subdomain_frame)
+    methods_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    ttk.Checkbutton(methods_frame, text="Certificate Transparency Logs (crt.sh)", variable=ct_logs_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Bruteforce", variable=bruteforce_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Databases (hackertarget, riddler)", variable=dns_dbs_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="SecurityTrails API (requires API key)", variable=securitytrails_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Zone Transfer Attempt", variable=zone_transfer_var).pack(side=tk.LEFT, padx=5)
+
+
+    # ── 4) SEARCH ROW ─────────────────────────────────────────
+    search_frame = ttk.Frame(subdomain_frame)
+    search_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(search_frame, text="Filter Results:").pack(side=tk.LEFT)
+    search_entry = ttk.Entry(search_frame, width=40)
+    search_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    search_btn = ttk.Button(search_frame, text="Filter", state=tk.DISABLED, command=on_search)
+    search_btn.pack(side=tk.LEFT)
+    search_entry.bind("<Return>", on_search)
+
+    # ── 5) OUTPUT AREA ────────────────────────────────────────
+    subdomain_output = scrolledtext.ScrolledText(
+        subdomain_frame, wrap=tk.WORD, width=80, height=15
+    )
+    subdomain_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    # ── 6) BOTTOM BUTTON BAR ──────────────────────────────────
+    button_frame = ttk.Frame(subdomain_frame)
+    button_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    discover_btn  = ttk.Button(button_frame, text="Discover Subdomains", command=on_discover)
+    export_btn    = ttk.Button(button_frame, text="Export Results",   state=tk.DISABLED, command=export_subdomains)
+    analyze_btn   = ttk.Button(button_frame, text="Analyze Live (Not Implemented)",  state=tk.DISABLED, command=analyze_subdomains) # Renamed for clarity
+    integrate_btn = ttk.Button(button_frame, text="Send First to Main Tool", command=integrate_with_main) # Renamed for clarity
+
+    for btn in (discover_btn, export_btn, analyze_btn, integrate_btn):
+        btn.pack(side=tk.LEFT, padx=5)
 
     return subdomain_frame
 
@@ -900,6 +953,24 @@ def generate_bucket_names(target: str) -> List[str]:
                 bucket_names.append(name)
     logging.debug(f"Generated {len(bucket_names)} potential bucket names for {target}")
     return sorted(set(bucket_names))
+
+def validate_bucket_name(bucket_name: str) -> bool:
+    """Validate an S3 bucket name according to AWS naming rules."""
+    if not (3 <= len(bucket_name) <= 63):
+        return False
+    # Must be lowercase letters, numbers, dots, or hyphens
+    if not re.match(r'^[a-z0-9.-]+$', bucket_name):
+        return False
+    # Must not start or end with a hyphen or dot
+    if bucket_name.startswith(('-', '.')) or bucket_name.endswith(('-', '.')):
+        return False
+    # Must not contain consecutive dots or dot-hyphen combinations
+    if '..' in bucket_name or '.-' in bucket_name or '-.' in bucket_name:
+        return False
+    # Must not be an IP address format
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', bucket_name):
+        return False
+    return True
 
 # Extract S3 buckets (modified to respect generate_buckets flag)
 def extract_s3_buckets(
@@ -964,7 +1035,8 @@ def analyze_input(
     use_github_search: bool = False,
     use_esprima: bool = False,
     node_script_path: str = DEFAULT_NODE_SCRIPT_PATH,
-    generate_buckets: bool = False
+    generate_buckets: bool = False,
+    scan_subdirs: bool = False
 ) -> Tuple[List[str], List[Tuple[str, str]], Dict[str, List[str]]]:
     """Analyze input to extract endpoints and S3 buckets."""
     endpoints = []
@@ -983,13 +1055,21 @@ def analyze_input(
                 if os.path.exists(temp_js_path) and os.path.getsize(temp_js_path) > 0:
                     logging.debug(f"Running Esprima on {temp_js_path}")
                     esprima_endpoints = run_esprima_parser(temp_js_path, node_script_path)
-                    current_endpoints.extend(esprima_endpoints)
-                    js_endpoints[source] = sorted(set(esprima_endpoints))
+                    if esprima_endpoints:
+                        current_endpoints.extend(esprima_endpoints)
+                        js_endpoints[source] = sorted(set(esprima_endpoints))
+                    else:
+                        logging.warning(f"Esprima returned no endpoints for {source}; falling back to regex")
+                        current_endpoints.extend(extract_endpoints(js_code, file_ext))
+                        js_endpoints[source] = sorted(set(current_endpoints))
                 else:
-                    logging.warning(f"Temporary JS file {temp_js_path} is empty or not created")
+                    logging.warning(f"Temporary JS file {temp_js_path} is empty or not created; using regex")
+                    current_endpoints.extend(extract_endpoints(js_code, file_ext))
+                    js_endpoints[source] = sorted(set(current_endpoints))
             except Exception as e:
                 logging.error(f"Esprima processing failed for {source}: {str(e)}")
                 current_endpoints.extend(extract_endpoints(js_code, file_ext))
+                js_endpoints[source] = sorted(set(current_endpoints))
             finally:
                 if 'temp_js_path' in locals() and os.path.exists(temp_js_path):
                     try:
@@ -1000,6 +1080,7 @@ def analyze_input(
         else:
             current_endpoints.extend(extract_endpoints(js_code, file_ext))
             logging.debug(f"Extracted {len(current_endpoints)} endpoints from {source} using regex")
+            js_endpoints[source] = sorted(set(current_endpoints))
         
         if use_linkfinder and file_ext == ".js":
             try:
@@ -1030,25 +1111,24 @@ def analyze_input(
     logging.info(f"Analyzing input: {input_str}")
     if os.path.isfile(input_str):
         try:
-            with open(input_str, "r", encoding="utf-8", errors="ignore") as f:
+            with open(input_str, "r", encoding="utf-8") as f:
                 content = f.read()
-                if not content.strip():
-                    logging.warning(f"Empty file content: {input_str}")
-                    return [], [], {}
-                file_ext = os.path.splitext(input_str)[1].lower()
-                logging.debug(f"Processing file {input_str} with extension {file_ext}")
-                if file_ext == ".html":
-                    js_blocks = extract_js_from_html(content)
-                    content = "\n".join(js_blocks)
-                    logging.debug(f"Extracted {len(js_blocks)} JS blocks from HTML")
-                current_endpoints = process_js_content(content, input_str, file_ext)
-                endpoints.extend(current_endpoints)
-                logging.info(f"Extracted {len(current_endpoints)} endpoints from file")
-                s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search, generate_buckets)
+            file_ext = os.path.splitext(input_str)[1].lower()
+            if file_ext == ".js":
+                endpoints = process_js_content(content, input_str, file_ext)
+                js_endpoints[input_str] = endpoints
+            elif file_ext in [".html", ".htm"]:
+                js_blocks = extract_js_from_html(content)
+                for i, script in enumerate(js_blocks):
+                    script_endpoints = process_js_content(script, f"{input_str}:inline_{i}", ".js")
+                    endpoints.extend(script_endpoints)
+                    js_endpoints[f"{input_str}:inline_{i}"] = script_endpoints
+            else:
+                endpoints = extract_endpoints(content, file_ext)
+            endpoints = sorted(set(endpoints))
+            logging.info(f"Processed file {input_str}, found {len(endpoints)} endpoints")
         except Exception as e:
-            logging.error(f"File processing error for {input_str}: {str(e)}")
-            messagebox.showerror("File Error", str(e))
-            return [], [], {}
+            logging.error(f"Failed to process file {input_str}: {str(e)}")
     elif input_str.startswith("http"):
         visited = set()
         queue = deque([(input_str, 0)])
@@ -1056,6 +1136,7 @@ def analyze_input(
         base_domain = urlparse(input_str).netloc
         all_js_files = []
         page_count = 0
+        subdir_js_files = []
 
         logging.debug(f"Fetching sitemap for {input_str}")
         sitemap_urls = parse_sitemap(input_str)
@@ -1064,6 +1145,39 @@ def analyze_input(
                 queue.append((s_url, 0))
                 to_process.append((s_url, 0))
         logging.debug(f"Found {len(sitemap_urls)} sitemap URLs")
+
+        def crawl_subdirs(base_url: str) -> List[str]:
+            js_files = []
+            parsed = urlparse(base_url)
+            base_path = parsed.scheme + "://" + parsed.netloc
+            directories = ["/js/", "/scripts/", "/assets/", "/static/"]
+            for dir_path in directories:
+                dir_url = urljoin(base_path, dir_path)
+                try:
+                    content, content_type = fetch_url_content(dir_url, respect_robots)
+                    if content and "html" in content_type.lower():
+                        soup = BeautifulSoup(content, "html.parser")
+                        for link in soup.find_all("a", href=True):
+                            href = link.get("href")
+                            if href.endswith(".js"):
+                                js_url = urljoin(dir_url, href)
+                                if urlparse(js_url).netloc == base_domain:
+                                    js_files.append(js_url)
+                                    logging.debug(f"Found JS file in subdirectory: {js_url}")
+                    else:
+                        logging.debug(f"Directory {dir_url} is not HTML or inaccessible")
+                except Exception as e:
+                    logging.debug(f"Failed to crawl directory {dir_url}: {str(e)}")
+            return js_files
+
+        # Run subdirectory crawl (your snippet)
+        if include_all_linked and scan_subdirs:
+            subdir_js_files = crawl_subdirs(input_str)
+            logging.info(f"Found {len(subdir_js_files)} JS files in subdirectories")
+            for js_url in subdir_js_files:
+                if js_url not in visited:
+                    queue.append((js_url, 0))
+                    to_process.append((js_url, 0))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             while queue and page_count < max_pages:
@@ -1113,6 +1227,15 @@ def analyze_input(
                     all_js_files.append(url)
                     logging.debug(f"Extracted {len(current_endpoints)} endpoints from {url}")
 
+                # Crawl linked pages if within depth
+                if file_ext == ".html" and depth < crawl_depth:
+                    soup = BeautifulSoup(html_content, "html.parser")
+                    for link in soup.find_all("a", href=True):
+                        href = urljoin(url, link.get("href"))
+                        if urlparse(href).netloc == base_domain and href not in visited:
+                            queue.append((href, depth + 1))
+                            to_process.append((href, depth + 1))
+
                 endpoints.extend(current_endpoints)
 
                 if progress_var and progress_bar:
@@ -1124,11 +1247,73 @@ def analyze_input(
         endpoints = sorted(set(endpoints))
         logging.info(f"Processed {len(all_js_files)} JS files, found {len(endpoints)} total endpoints")
         s3_buckets = extract_s3_buckets(endpoints, input_str, github_pat, use_github_search, generate_buckets)
-    else:
-        messagebox.showerror("Invalid Input", "Please enter a valid file path or URL.")
-        return [], [], {}
 
     return endpoints, s3_buckets, js_endpoints
+    
+def process_js_content(js_code: str, source: str, file_ext: str = ".js") -> List[str]:
+    """Process JavaScript content with Esprima or fallback."""
+    current_endpoints = []
+    logging.debug(f"Processing JS content from {source} (type: {file_ext})")
+    if use_esprima and file_ext == ".js":
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".js", mode='w', encoding='utf-8') as temp_js:
+                temp_js.write(js_code)
+                temp_js_path = temp_js.name
+            if os.path.exists(temp_js_path) and os.path.getsize(temp_js_path) > 0:
+                logging.debug(f"Running Esprima on {temp_js_path}")
+                esprima_endpoints = run_esprima_parser(temp_js_path, node_script_path)
+                if esprima_endpoints:
+                    current_endpoints.extend(esprima_endpoints)
+                    js_endpoints[source] = sorted(set(esprima_endpoints))
+                else:
+                    logging.warning(f"Esprima returned no endpoints for {source}; falling back to regex")
+                    current_endpoints.extend(extract_endpoints(js_code, file_ext))
+                    js_endpoints[source] = sorted(set(current_endpoints))
+            else:
+                logging.warning(f"Temporary JS file {temp_js_path} is empty or not created; using regex")
+                current_endpoints.extend(extract_endpoints(js_code, file_ext))
+                js_endpoints[source] = sorted(set(current_endpoints))
+        except Exception as e:
+            logging.error(f"Esprima processing failed for {source}: {str(e)}")
+            current_endpoints.extend(extract_endpoints(js_code, file_ext))
+            js_endpoints[source] = sorted(set(current_endpoints))
+        finally:
+            if 'temp_js_path' in locals() and os.path.exists(temp_js_path):
+                try:
+                    os.unlink(temp_js_path)
+                    logging.debug(f"Deleted temporary JS file: {temp_js_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete temporary file {temp_js_path}: {str(e)}")
+    else:
+        current_endpoints.extend(extract_endpoints(js_code, file_ext))
+        logging.debug(f"Extracted {len(current_endpoints)} endpoints from {source} using regex")
+        js_endpoints[source] = sorted(set(current_endpoints))
+    
+    if use_linkfinder and file_ext == ".js":
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".js", mode='w', encoding='utf-8') as temp_js:
+                temp_js.write(js_code)
+                temp_js_path = temp_js.name
+            if os.path.exists(temp_js_path) and os.path.getsize(temp_js_path) > 0:
+                logging.debug(f"Running LinkFinder on {temp_js_path}")
+                lf_endpoints = run_linkfinder(temp_js_path)
+                current_endpoints.extend(lf_endpoints)
+                if source in js_endpoints:
+                    js_endpoints[source].extend(lf_endpoints)
+                    js_endpoints[source] = sorted(set(js_endpoints[source]))
+                else:
+                    js_endpoints[source] = sorted(set(lf_endpoints))
+                logging.debug(f"LinkFinder found {len(lf_endpoints)} endpoints in {source}")
+        except Exception as e:
+            logging.error(f"LinkFinder processing failed for {source}: {str(e)}")
+        finally:
+            if 'temp_js_path' in locals() and os.path.exists(temp_js_path):
+                try:
+                    os.unlink(temp_js_path)
+                except Exception as e:
+                    logging.error(f"Failed to delete temporary file {temp_js_path}: {str(e)}")
+    
+    return current_endpoints
 
 # GUI (modified to add S3 bucket generation toggle)
 def create_gui():
@@ -1144,20 +1329,20 @@ def create_gui():
 
     config_frame = ttk.Frame(main_frame)
     config_frame.pack(padx=10, pady=5, fill=tk.X)
-    
+
     config = load_config()
     ttk.Label(config_frame, text="LinkFinder Path:").pack(side=tk.LEFT)
     linkfinder_entry = ttk.Entry(config_frame, width=20)
     linkfinder_entry.insert(0, config.get("linkfinder_path", DEFAULT_LINKFINDER_PATH))
     linkfinder_entry.pack(side=tk.LEFT, padx=(0, 5))
     ttk.Button(config_frame, text="Browse", command=lambda: on_browse_linkfinder(linkfinder_entry)).pack(side=tk.LEFT)
-    
+
     ttk.Label(config_frame, text="Node.js Script:").pack(side=tk.LEFT, padx=5)
     node_script_entry = ttk.Entry(config_frame, width=20)
     node_script_entry.insert(0, config.get("node_script_path", DEFAULT_NODE_SCRIPT_PATH))
     node_script_entry.pack(side=tk.LEFT, padx=(0, 5))
     ttk.Button(config_frame, text="Browse", command=lambda: on_browse_node_script(node_script_entry)).pack(side=tk.LEFT)
-    
+
     ttk.Label(config_frame, text="GitHub PAT:").pack(side=tk.LEFT, padx=5)
     github_pat_entry = ttk.Entry(config_frame, width=20, show="*")
     github_pat_entry.insert(0, config.get("github_pat", ""))
@@ -1189,8 +1374,18 @@ def create_gui():
     js_filter_entry.pack(side=tk.LEFT, padx=5)
     ttk.Label(js_filter_frame, text="(Leave blank for all JS files)").pack(side=tk.LEFT)
 
-    subdomain_tab = create_subdomain_tab(notebook, entry)
-    
+    subdir_frame = ttk.Frame(main_frame)
+    subdir_frame.pack(padx=10, pady=5, fill=tk.X)
+    scan_subdirs_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        subdir_frame,
+        text="Scan subdirectories for JS files",
+        variable=scan_subdirs_var
+    ).pack(side=tk.LEFT, padx=5)
+
+    # Pass the root object to create_subdomain_tab
+    subdomain_tab = create_subdomain_tab(notebook, entry, root)
+
     results_tab = ttk.Frame(notebook)
     notebook.add(results_tab, text="Consolidated Results")
     results_output = scrolledtext.ScrolledText(results_tab, wrap=tk.WORD, width=80, height=20)
@@ -1229,7 +1424,8 @@ def create_gui():
         variable=generate_buckets_var
     ).pack(side=tk.LEFT, padx=5)
 
-    def on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=False):
+
+    def on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=False, scan_subdirs=False):
         input_val = entry.get().strip()
         github_pat = github_pat_entry.get().strip()
         node_script_path = node_script_entry.get().strip()
@@ -1252,7 +1448,7 @@ def create_gui():
         config["github_pat"] = github_pat
         config["node_script_path"] = node_script_path
         save_config(config)
-        
+
         use_linkfinder = linkfinder_var.get() and (bool(linkfinder_main) or os.path.exists(config.get("linkfinder_path", DEFAULT_LINKFINDER_PATH)))
         if linkfinder_var.get() and not use_linkfinder:
             messagebox.showwarning(
@@ -1289,7 +1485,8 @@ def create_gui():
                 use_github_search=use_github_search,
                 use_esprima=use_esprima,
                 node_script_path=node_script_path,
-                generate_buckets=generate_buckets
+                generate_buckets=generate_buckets,
+                scan_subdirs=scan_subdirs
             )
 
             output_area.insert(tk.END, "=== JavaScript Files and Endpoints ===\n")
@@ -1334,6 +1531,14 @@ def create_gui():
 
         threading.Thread(target=extraction_task, daemon=True).start()
 
+    def on_scan_subdirs():
+        input_val = entry.get().strip()
+        if not input_val:
+            messagebox.showerror("Error", "Please enter a URL or file path.")
+            return
+        on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=True, scan_subdirs=True)
+
+
     button_frame = ttk.Frame(main_frame)
     button_frame.pack(pady=5)
     export_s3_btn = ttk.Button(button_frame, text="Export S3 Results", state=tk.DISABLED,
@@ -1365,8 +1570,14 @@ def create_gui():
         text="Extract All JS (linked too)",
         command=lambda: on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, True)
     )
+    scan_subdirs_btn = ttk.Button(
+        button_frame,
+        text="Scan Subdirectories",
+        command=on_scan_subdirs
+    )
     extract_btn.pack(side=tk.LEFT, padx=5)
     extract_all_btn.pack(side=tk.LEFT, padx=5)
+    scan_subdirs_btn.pack(side=tk.LEFT, padx=5)
     export_s3_btn.pack(side=tk.LEFT, padx=5)
     export_all_btn.pack(side=tk.LEFT, padx=5)
     export_js_btn.pack(side=tk.LEFT, padx=5)
@@ -1379,8 +1590,250 @@ def create_gui():
     output_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=100, height=25)
     output_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
+
     load_cache()
     root.mainloop()
+
+
+def create_subdomain_tab(notebook: ttk.Notebook, main_entry: tk.Entry, root: tk.Tk) -> ttk.Frame:
+    # ── 1) SETUP FRAME ─────────────────────────────────────────
+    subdomain_frame = ttk.Frame(notebook)
+    notebook.add(subdomain_frame, text="Subdomain Discovery")
+
+    # Define BooleanVars for discovery methods
+    ct_logs_var = tk.BooleanVar(value=True)
+    bruteforce_var = tk.BooleanVar(value=False)
+    dns_dbs_var = tk.BooleanVar(value=True)
+    securitytrails_var = tk.BooleanVar(value=False)
+    zone_transfer_var = tk.BooleanVar(value=False)
+
+
+    # ── 2) DEFINE CALLBACKS ───────────────────────────────────
+    def validate_domain(domain: str) -> bool:
+        return bool(re.match(
+            r'^[a-zA-Z0-9][a-zA-Z0-9.-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$',
+            domain)
+        )
+
+    def on_discover():
+        domain = domain_entry.get().strip()
+        if not validate_domain(domain):
+            messagebox.showerror("Error", "Please enter a valid domain (e.g. example.com)")
+            return
+
+        # clear & header
+        subdomain_output.delete("1.0", tk.END)
+        subdomain_output.insert(tk.END, f"Discovering subdomains for {domain}...\n\n")
+        subdomain_output.see(tk.END) # Scroll to the end
+
+        discovered = set()
+        wordlist_path = wordlist_entry.get().strip() or DEFAULT_WORDLIST # Get wordlist path
+        securitytrails_api_key = securitytrails_api_key_entry.get().strip() # Get SecurityTrails API Key
+
+
+        def worker(root):
+            # Function to safely update the GUI from the worker thread
+            def update_output(message):
+                subdomain_output.insert(tk.END, message)
+                subdomain_output.see(tk.END)
+
+            if ct_logs_var.get():
+                root.after(0, update_output, "Querying Certificate Transparency logs...\n")
+                try:
+                    ct_subs = query_certificate_transparency(domain)
+                    discovered.update(ct_subs)
+                    root.after(0, update_output, f"Found {len(ct_subs)} subdomains via CT logs.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error querying CT logs: {str(e)}\n")
+
+
+            if bruteforce_var.get():
+                root.after(0, update_output, f"Starting DNS bruteforce with {wordlist_path}...\n")
+                try:
+                    brute_subs = dns_bruteforce(domain, wordlist_path)
+                    discovered.update(brute_subs)
+                    root.after(0, update_output, f"Found {len(brute_subs)} subdomains via bruteforce.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error during bruteforce: {str(e)}\n")
+
+
+            if dns_dbs_var.get():
+                root.after(0, update_output, "Querying DNS databases...\n")
+                try:
+                    db_subs = query_dns_dbs(domain)
+                    discovered.update(db_subs)
+                    root.after(0, update_output, f"Found {len(db_subs)} subdomains via DNS databases.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error querying DNS databases: {str(e)}\n")
+
+
+            if securitytrails_var.get():
+                if securitytrails_api_key:
+                    root.after(0, update_output, "Querying SecurityTrails...\n")
+                    try:
+                        st_subs = query_securitytrails(domain, securitytrails_api_key)
+                        discovered.update(st_subs)
+                        root.after(0, update_output, f"Found {len(st_subs)} subdomains via SecurityTrails.\n")
+                    except Exception as e:
+                        root.after(0, update_output, f"Error querying SecurityTrails: {str(e)}\n")
+                else:
+                     root.after(0, update_output, "Skipping SecurityTrails query: API key not provided.\n")
+
+
+            if zone_transfer_var.get():
+                root.after(0, update_output, "Attempting DNS zone transfer...\n")
+                try:
+                    zt_subs = attempt_zone_transfer(domain)
+                    discovered.update(zt_subs)
+                    root.after(0, update_output, f"Found {len(zt_subs)} subdomains via zone transfer.\n")
+                except Exception as e:
+                    root.after(0, update_output, f"Error during zone transfer attempt: {str(e)}\n")
+
+
+            results = sorted(list(discovered))
+
+            # display results in the main output area
+            root.after(0, subdomain_output.insert, tk.END, "\n=== Complete ===\n")
+            root.after(0, subdomain_output.insert, tk.END, f"Total unique subdomains found: {len(results)}\n")
+            root.after(0, subdomain_output.insert, tk.END, "\n".join(results) + "\n")
+            root.after(0, subdomain_output.see, tk.END)
+
+
+            # enable the other buttons (update in the main thread)
+            root.after(0, export_btn.config, state=tk.NORMAL)
+            root.after(0, analyze_btn.config, state=tk.NORMAL)
+            root.after(0, search_btn.config, state=tk.NORMAL)
+            search_btn.data = results # Store results for searching and exporting (can be done in worker thread)
+
+        threading.Thread(target=worker, args=(root,), daemon=True).start()
+
+
+    def on_search(event=None):
+        all_subs = getattr(search_btn, "data", [])
+        if not all_subs:
+            return
+
+        q = search_entry.get().strip().lower()
+        if not q:
+            filtered = all_subs
+        else:
+            filtered = [s for s in all_subs if q in s.lower()]
+
+        # Clear and display filtered results
+        subdomain_output.delete("1.0", tk.END)
+        if filtered:
+            subdomain_output.insert(tk.END, f"Found {len(filtered)} matching subdomains:\n\n")
+            subdomain_output.insert(tk.END, "\n".join(filtered) + "\n")
+        else:
+            subdomain_output.insert(tk.END, "No matching subdomains found.\n")
+        subdomain_output.see(tk.END)
+
+
+    def export_subdomains():
+        subs = getattr(search_btn, "data", [])
+        if not subs:
+            messagebox.showinfo("Export", "No subdomains to export.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(subs))
+            messagebox.showinfo("Export", f"Saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export subdomains: {str(e)}")
+
+
+    def analyze_subdomains():
+        subs = getattr(search_btn, "data", [])
+        if not subs:
+            messagebox.showinfo("Analyze", "No subdomains to analyze.")
+            return
+        # Placeholder for liveness checks or other analysis
+        messagebox.showinfo("Analyze", f"Analyzing {len(subs)} subdomains (Analysis not fully implemented).")
+
+
+    def integrate_with_main():
+        subs = getattr(search_btn, "data", [])
+        if not subs:
+            messagebox.showinfo("Integrate", "No subdomains to send.")
+            return
+        # Example: pick the first subdomain and insert into the main tab’s entry:
+        if subs:
+            main_entry.delete(0, tk.END)
+            # Prepend https:// for consistency if it's a URL input field
+            main_entry.insert(0, f"https://{subs[0]}")
+            notebook.select(0)  # switch back to main tab
+        else:
+             messagebox.showinfo("Integrate", "No subdomains to send.")
+
+
+    # ── 3) DOMAIN ENTRY AND OPTIONS ────────────────────────────
+    domain_frame = ttk.Frame(subdomain_frame)
+    domain_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(domain_frame, text="Target Domain:").pack(side=tk.LEFT)
+    domain_entry = ttk.Entry(domain_frame, width=40)
+    domain_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    # Add SecurityTrails API Key Entry
+    securitytrails_frame = ttk.Frame(subdomain_frame)
+    securitytrails_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(securitytrails_frame, text="SecurityTrails API Key:").pack(side=tk.LEFT)
+    securitytrails_api_key_entry = ttk.Entry(securitytrails_frame, width=40, show="*")
+    securitytrails_api_key_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+     # Optional: Load API key from config if you add it there
+
+    # Add Wordlist Entry
+    wordlist_frame = ttk.Frame(subdomain_frame)
+    wordlist_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(wordlist_frame, text="Wordlist Path (for bruteforce):").pack(side=tk.LEFT)
+    wordlist_entry = ttk.Entry(wordlist_frame, width=40)
+    wordlist_entry.insert(0, DEFAULT_WORDLIST) # Default path
+    wordlist_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    ttk.Button(wordlist_frame, text="Browse", command=lambda: on_browse(wordlist_entry)).pack(side=tk.LEFT)
+
+
+    # Add Checkboxes for Discovery Methods
+    methods_frame = ttk.Frame(subdomain_frame)
+    methods_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    ttk.Checkbutton(methods_frame, text="Certificate Transparency Logs (crt.sh)", variable=ct_logs_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Bruteforce", variable=bruteforce_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Databases (hackertarget, riddler)", variable=dns_dbs_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="SecurityTrails API (requires API key)", variable=securitytrails_var).pack(side=tk.LEFT, padx=5)
+    ttk.Checkbutton(methods_frame, text="DNS Zone Transfer Attempt", variable=zone_transfer_var).pack(side=tk.LEFT, padx=5)
+
+
+    # ── 4) SEARCH ROW ─────────────────────────────────────────
+    search_frame = ttk.Frame(subdomain_frame)
+    search_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(search_frame, text="Filter Results:").pack(side=tk.LEFT)
+    search_entry = ttk.Entry(search_frame, width=40)
+    search_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    search_btn = ttk.Button(search_frame, text="Filter", state=tk.DISABLED, command=on_search)
+    search_btn.pack(side=tk.LEFT)
+    search_entry.bind("<Return>", on_search)
+
+    # ── 5) OUTPUT AREA ────────────────────────────────────────
+    subdomain_output = scrolledtext.ScrolledText(
+        subdomain_frame, wrap=tk.WORD, width=80, height=15
+    )
+    subdomain_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    # ── 6) BOTTOM BUTTON BAR ──────────────────────────────────
+    button_frame = ttk.Frame(subdomain_frame)
+    button_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    discover_btn  = ttk.Button(button_frame, text="Discover Subdomains", command=on_discover)
+    export_btn    = ttk.Button(button_frame, text="Export Results",   state=tk.DISABLED, command=export_subdomains)
+    analyze_btn   = ttk.Button(button_frame, text="Analyze Live (Not Implemented)",  state=tk.DISABLED, command=analyze_subdomains) # Renamed for clarity
+    integrate_btn = ttk.Button(button_frame, text="Send First to Main Tool", command=integrate_with_main) # Renamed for clarity
+
+    for btn in (discover_btn, export_btn, analyze_btn, integrate_btn):
+        btn.pack(side=tk.LEFT, padx=5)
+
+    return subdomain_frame
 
 if __name__ == "__main__":
     create_gui()
