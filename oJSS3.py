@@ -736,81 +736,73 @@ def create_subdomain_tab(notebook: ttk.Notebook, main_entry: tk.Entry) -> ttk.Fr
         securitytrails_api_key = securitytrails_api_key_entry.get().strip() # Get SecurityTrails API Key
 
 
-        def worker():
-            # Function to safely update the GUI from the worker thread
-            def update_output(message):
-                subdomain_output.insert(tk.END, message)
-                subdomain_output.see(tk.END)
+def worker(root):
+    # Function to safely update the GUI from the worker thread
+    def update_output(message):
+        subdomain_output.insert(tk.END, message)
+        subdomain_output.see(tk.END)
 
-            if ct_logs_var.get():
-                root.after(0, update_output, "Querying Certificate Transparency logs...\n")
-                try:
-                    ct_subs = query_certificate_transparency(domain)
-                    discovered.update(ct_subs)
-                    root.after(0, update_output, f"Found {len(ct_subs)} subdomains via CT logs.\n")
-                except Exception as e:
-                    root.after(0, update_output, f"Error querying CT logs: {str(e)}\n")
+    if ct_logs_var.get():
+        root.after(0, update_output, "Querying Certificate Transparency logs...\n")
+        try:
+            ct_subs = query_certificate_transparency(domain)
+            discovered.update(ct_subs)
+            root.after(0, update_output, f"Found {len(ct_subs)} subdomains via CT logs.\n")
+        except Exception as e:
+            root.after(0, update_output, f"Error querying CT logs: {str(e)}\n")
 
+    if bruteforce_var.get():
+        root.after(0, update_output, f"Starting DNS bruteforce with {wordlist_path}...\n")
+        try:
+            brute_subs = dns_bruteforce(domain, wordlist_path)
+            discovered.update(brute_subs)
+            root.after(0, update_output, f"Found {len(brute_subs)} subdomains via bruteforce.\n")
+        except Exception as e:
+            root.after(0, update_output, f"Error during bruteforce: {str(e)}\n")
 
-            if bruteforce_var.get():
-                root.after(0, update_output, f"Starting DNS bruteforce with {wordlist_path}...\n")
-                try:
-                    brute_subs = dns_bruteforce(domain, wordlist_path)
-                    discovered.update(brute_subs)
-                    root.after(0, update_output, f"Found {len(brute_subs)} subdomains via bruteforce.\n")
-                except Exception as e:
-                    root.after(0, update_output, f"Error during bruteforce: {str(e)}\n")
+    if dns_dbs_var.get():
+        root.after(0, update_output, "Querying DNS databases...\n")
+        try:
+            db_subs = query_dns_dbs(domain)
+            discovered.update(db_subs)
+            root.after(0, update_output, f"Found {len(db_subs)} subdomains via DNS databases.\n")
+        except Exception as e:
+            root.after(0, update_output, f"Error querying DNS databases: {str(e)}\n")
 
+    if securitytrails_var.get():
+        if securitytrails_api_key:
+            root.after(0, update_output, "Querying SecurityTrails...\n")
+            try:
+                st_subs = query_securitytrails(domain, securitytrails_api_key)
+                discovered.update(st_subs)
+                root.after(0, update_output, f"Found {len(st_subs)} subdomains via SecurityTrails.\n")
+            except Exception as e:
+                root.after(0, update_output, f"Error querying SecurityTrails: {str(e)}\n")
+        else:
+            root.after(0, update_output, "Skipping SecurityTrails query: API key not provided.\n")
 
-            if dns_dbs_var.get():
-                root.after(0, update_output, "Querying DNS databases...\n")
-                try:
-                    db_subs = query_dns_dbs(domain)
-                    discovered.update(db_subs)
-                    root.after(0, update_output, f"Found {len(db_subs)} subdomains via DNS databases.\n")
-                except Exception as e:
-                    root.after(0, update_output, f"Error querying DNS databases: {str(e)}\n")
+    if zone_transfer_var.get():
+        root.after(0, update_output, "Attempting DNS zone transfer...\n")
+        try:
+            zt_subs = attempt_zone_transfer(domain)
+            discovered.update(zt_subs)
+            root.after(0, update_output, f"Found {len(zt_subs)} subdomains via zone transfer.\n")
+        except Exception as e:
+            root.after(0, update_output, f"Error during zone transfer attempt: {str(e)}\n")
 
+    results = sorted(list(discovered))
 
-            if securitytrails_var.get():
-                if securitytrails_api_key:
-                    root.after(0, update_output, "Querying SecurityTrails...\n")
-                    try:
-                        st_subs = query_securitytrails(domain, securitytrails_api_key)
-                        discovered.update(st_subs)
-                        root.after(0, update_output, f"Found {len(st_subs)} subdomains via SecurityTrails.\n")
-                    except Exception as e:
-                        root.after(0, update_output, f"Error querying SecurityTrails: {str(e)}\n")
-                else:
-                     root.after(0, update_output, "Skipping SecurityTrails query: API key not provided.\n")
+    # display results in the main output area
+    root.after(0, subdomain_output.insert, tk.END, "\n=== Complete ===\n")
+    root.after(0, subdomain_output.insert, tk.END, f"Total unique subdomains found: {len(results)}\n")
+    root.after(0, subdomain_output.insert, tk.END, "\n".join(results) + "\n")
+    root.after(0, subdomain_output.see, tk.END)
 
-
-            if zone_transfer_var.get():
-                root.after(0, update_output, "Attempting DNS zone transfer...\n")
-                try:
-                    zt_subs = attempt_zone_transfer(domain)
-                    discovered.update(zt_subs)
-                    root.after(0, update_output, f"Found {len(zt_subs)} subdomains via zone transfer.\n")
-                except Exception as e:
-                    root.after(0, update_output, f"Error during zone transfer attempt: {str(e)}\n")
-
-
-            results = sorted(list(discovered))
-
-            # display results in the main output area
-            root.after(0, subdomain_output.insert, tk.END, "\n=== Complete ===\n")
-            root.after(0, subdomain_output.insert, tk.END, f"Total unique subdomains found: {len(results)}\n")
-            root.after(0, subdomain_output.insert, tk.END, "\n".join(results) + "\n")
-            root.after(0, subdomain_output.see, tk.END)
-
-
-            # enable the other buttons (update in the main thread)
-            root.after(0, export_btn.config, state=tk.NORMAL)
-            root.after(0, analyze_btn.config, state=tk.NORMAL)
-            root.after(0, search_btn.config, state=tk.NORMAL)
-            search_btn.data = results # Store results for searching and exporting (can be done in worker thread)
-
-        threading.Thread(target=worker, daemon=True).start()
+    # enable the other buttons (update in the main thread)
+    root.after(0, lambda: export_btn.config(state=tk.NORMAL))
+    root.after(0, lambda: analyze_btn.config(state=tk.NORMAL))
+    root.after(0, lambda: search_btn.config(state=tk.NORMAL))
+    search_btn.data = results # Store results for searching and exporting (can be done in worker thread)
 
 
     def on_search(event=None):
@@ -1019,6 +1011,26 @@ def extract_s3_buckets(
     
     logging.info(f"Total S3 buckets extracted: {len(s3_buckets)}")
     return sorted(s3_buckets, key=lambda x: x[0])
+
+def send_api_request(base_url: str, endpoint_path: str, method: str, body: Optional[str] = None, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[requests.Response], str]:
+    """Send an HTTP request to an endpoint and return the response."""
+    full_url = urljoin(base_url, endpoint_path)
+    method = method.upper()
+    headers = headers or {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    try:
+        response = requests.request(
+            method=method,
+            url=full_url,
+            headers=headers,
+            data=body if body else None,
+            timeout=10
+        )
+        logging.info(f"Sent {method} request to {full_url}, status: {response.status_code}")
+        return response, ""
+    except requests.RequestException as e:
+        logging.error(f"Failed to send {method} request to {full_url}: {str(e)}")
+        return None, str(e)
 
 # Analyze input (modified for clearer logging)
 def analyze_input(
@@ -1383,13 +1395,64 @@ def create_gui():
         variable=scan_subdirs_var
     ).pack(side=tk.LEFT, padx=5)
 
-    # Pass the root object to create_subdomain_tab
     subdomain_tab = create_subdomain_tab(notebook, entry, root)
 
     results_tab = ttk.Frame(notebook)
     notebook.add(results_tab, text="Consolidated Results")
     results_output = scrolledtext.ScrolledText(results_tab, wrap=tk.WORD, width=80, height=20)
     results_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # Add Endpoint Tester Tab
+    tester_frame = ttk.Frame(notebook)
+    notebook.add(tester_frame, text="Endpoint Tester")
+
+    # Base URL
+    base_url_frame = ttk.Frame(tester_frame)
+    base_url_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(base_url_frame, text="Base URL:").pack(side=tk.LEFT)
+    base_url_entry = ttk.Entry(base_url_frame, width=50)
+    base_url_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    # Endpoint Path
+    endpoint_frame = ttk.Frame(tester_frame)
+    endpoint_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(endpoint_frame, text="Endpoint Path:").pack(side=tk.LEFT)
+    endpoint_entry = ttk.Entry(endpoint_frame, width=50)
+    endpoint_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    # HTTP Method
+    method_frame = ttk.Frame(tester_frame)
+    method_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(method_frame, text="HTTP Method:").pack(side=tk.LEFT)
+    method_var = tk.StringVar(value="GET")
+    methods = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"]
+    method_menu = ttk.OptionMenu(method_frame, method_var, "GET", *methods)
+    method_menu.pack(side=tk.LEFT, padx=5)
+
+    # Headers
+    headers_frame = ttk.Frame(tester_frame)
+    headers_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(headers_frame, text="Headers (JSON):").pack(side=tk.LEFT)
+    headers_text = scrolledtext.ScrolledText(headers_frame, wrap=tk.WORD, width=50, height=5)
+    headers_text.pack(fill=tk.X, padx=5, pady=5)
+    headers_text.insert(tk.END, '{\n  "Content-Type": "application/json"\n}')
+
+    # Request Body
+    body_frame = ttk.Frame(tester_frame)
+    body_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(body_frame, text="Request Body:").pack(side=tk.LEFT)
+    body_text = scrolledtext.ScrolledText(body_frame, wrap=tk.WORD, width=50, height=5)
+    body_text.pack(fill=tk.X, padx=5, pady=5)
+
+    # Send Button
+    send_frame = ttk.Frame(tester_frame)
+    send_frame.pack(fill=tk.X, padx=10, pady=5)
+    send_btn = ttk.Button(send_frame, text="Send Request", command=lambda: on_send_request())
+    send_btn.pack(side=tk.LEFT, padx=5)
+
+    # Response Output
+    response_output = scrolledtext.ScrolledText(tester_frame, wrap=tk.WORD, width=100, height=20)
+    response_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     options_frame = ttk.Frame(main_frame)
     options_frame.pack(padx=10, pady=5, fill=tk.X)
@@ -1423,7 +1486,6 @@ def create_gui():
         text="Generate potential S3 bucket names (may produce unrelated results)",
         variable=generate_buckets_var
     ).pack(side=tk.LEFT, padx=5)
-
 
     def on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=False, scan_subdirs=False):
         input_val = entry.get().strip()
@@ -1520,6 +1582,9 @@ def create_gui():
             export_all_btn.data = (input_val, endpoints, s3_buckets, js_endpoints)
             export_js_btn.data = js_endpoints
             export_html_btn.data = (input_val, endpoints, s3_buckets, js_endpoints)
+            # Store endpoints for tester tab
+            send_btn.endpoints = endpoints
+            send_btn.js_endpoints = js_endpoints
 
             export_s3_btn.config(state=tk.NORMAL if s3_buckets else tk.DISABLED)
             export_all_btn.config(state=tk.NORMAL if endpoints or s3_buckets or js_endpoints else tk.DISABLED)
@@ -1538,6 +1603,45 @@ def create_gui():
             return
         on_extract(entry, output_area, progress_var, progress_bar, depth_entry, linkfinder_var, js_filter_entry, max_pages_entry, respect_robots_var, include_all_linked=True, scan_subdirs=True)
 
+    def on_send_request():
+        base_url = base_url_entry.get().strip()
+        endpoint_path = endpoint_entry.get().strip()
+        method = method_var.get()
+        body = body_text.get("1.0", tk.END).strip()
+        headers_text_content = headers_text.get("1.0", tk.END).strip()
+
+        if not base_url or not endpoint_path:
+            messagebox.showerror("Error", "Please enter both Base URL and Endpoint Path.")
+            return
+
+        try:
+            headers = json.loads(headers_text_content) if headers_text_content else {}
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Error", f"Invalid JSON headers: {str(e)}")
+            return
+
+        def send_task():
+            response, error = send_api_request(base_url, endpoint_path, method, body, headers)
+            root.after(0, update_response, response, error)
+
+        def update_response(response, error):
+            response_output.delete("1.0", tk.END)
+            if error:
+                response_output.insert(tk.END, f"Error: {error}\n")
+                return
+            response_output.insert(tk.END, f"Status: {response.status_code} {response.reason}\n")
+            response_output.insert(tk.END, "\nHeaders:\n")
+            for key, value in response.headers.items():
+                response_output.insert(tk.END, f"{key}: {value}\n")
+            response_output.insert(tk.END, "\nBody:\n")
+            try:
+                json_body = response.json()
+                response_output.insert(tk.END, json.dumps(json_body, indent=2))
+            except ValueError:
+                response_output.insert(tk.END, response.text)
+            response_output.see(tk.END)
+
+        threading.Thread(target=send_task, daemon=True).start()
 
     button_frame = ttk.Frame(main_frame)
     button_frame.pack(pady=5)
@@ -1589,7 +1693,6 @@ def create_gui():
 
     output_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=100, height=25)
     output_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-
 
     load_cache()
     root.mainloop()
