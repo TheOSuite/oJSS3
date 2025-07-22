@@ -1,5 +1,9 @@
 # oJSS3.py - Endpoint and S3 Bucket Extractor
 
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![License](https://img.shields.io/github/license/TheOSuite/oJSS3)
+![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+
 This Python script is a versatile tool for web reconnaissance, capable of extracting potential API endpoints and identifying Amazon S3 buckets from various sources. It can process local files (HTML/JS), crawl websites, and perform subdomain discovery.
 
 ## Features
